@@ -1,0 +1,24 @@
+# Ignore build artifacts
+_build/
+deps/
+doc/
+*.ez
+.DS_Store
+
+# Ignore node modules (dev only)
+node_modules/
+package-lock.json
+
+# Ignore local config
+.env
+.env.local
+
+# Ignore crash dumps
+erl_crash.dump
+
+# Ignore logs
+*.log
+
+# Ignore large test files
+*.pgn.zst
+*.pgn

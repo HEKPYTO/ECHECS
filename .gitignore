@@ -1,0 +1,38 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Ignore package tarball (built via "mix hex.build").
+echecs-*.tar
+
+# Ignore OS files
+.DS_Store
+
+# Ignore large data files for testing
+*.pgn
+*.pgn.zst
+
+# Ignore Node.js / Comparison Testing Artifacts
+# These are for internal development/calibration only
+node_modules/
+package.json
+package-lock.json
+npm-debug.log
+test/comparison/

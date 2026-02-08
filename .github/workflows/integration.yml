@@ -1,0 +1,58 @@
+# Downloads and processes Lichess database files for testing
+name: Lichess DB Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.16'
+          otp-version: '26'
+          
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y zstd
+          
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+          
+      - name: Install dependencies
+        run: mix deps.get
+        
+      - name: Compile
+        run: mix compile
+        
+      - name: Download Lichess DB Sample (2015-01)
+        # Using a mid-sized monthly file for CI/CD speed (~270MB)
+        # Lichess DB files are typically named lichess_db_standard_rated_YYYY-MM.pgn.zst
+        # We'll use 2015-01 which is more up-to-date than 2013 but still manageable
+        run: |
+          echo "Attempting to download Lichess DB..."
+          wget -q --spider https://database.lichess.org/standard/lichess_db_standard_rated_2015-01.pgn.zst
+          if [ $? -eq 0 ]; then
+            wget -nv https://database.lichess.org/standard/lichess_db_standard_rated_2015-01.pgn.zst -O lichess_db_sample.pgn.zst
+          else
+            echo "Download failed or file not found. Skipping integration test."
+          fi
+        continue-on-error: true
+        
+      - name: Run Integration Test
+        # Run test only if file exists
+        if: hashFiles('lichess_db_sample.pgn.zst') != ''
+        env:
+          LICHESS_DB_PATH: lichess_db_sample.pgn.zst
+          SAMPLE_SIZE: 100000
+        run: mix test --include integration test/integration/lichess_db_test.exs
