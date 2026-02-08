@@ -54,5 +54,5 @@ jobs:
         if: hashFiles('lichess_db_sample.pgn.zst') != ''
         env:
           LICHESS_DB_PATH: lichess_db_sample.pgn.zst
-          SAMPLE_SIZE: 100000
+          SAMPLE_SIZE: 1000000
         run: mix test --include integration test/integration/lichess_db_test.exs
