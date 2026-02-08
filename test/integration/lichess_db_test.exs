@@ -112,7 +112,13 @@ defmodule Echecs.Integration.LichessDBTest do
         end
       end,
       fn {port, _} ->
-        if is_port(port), do: Port.close(port)
+        if is_port(port) do
+          try do
+            Port.close(port)
+          rescue
+            ArgumentError -> :ok
+          end
+        end
       end
     )
   end
