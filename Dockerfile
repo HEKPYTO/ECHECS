@@ -26,10 +26,10 @@ RUN addgroup -g 1000 echecs && \
     adduser -u 1000 -G echecs -D echecs && \
     chown -R echecs:echecs /app
 
+USER echecs
+
 RUN mix local.hex --force && \
     mix local.rebar --force
-
-USER echecs
 
 ENV MIX_ENV=prod
 
