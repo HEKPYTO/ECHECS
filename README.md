@@ -91,6 +91,12 @@ mix test --include integration test/integration/lichess_db_test.exs
 
 For a consistent environment or to deploy the engine, you can use the Docker image.
 
+### Pull from Registry
+Pre-built images are available on GitHub Container Registry:
+```bash
+docker pull ghcr.io/hekpyto/echecs:latest
+```
+
 ### Build the Image
 ```bash
 docker build -t echecs .
