@@ -27,9 +27,87 @@ defmodule Echecs.MoveGen do
   end
 
   @doc """
-  Generates pseudo-legal moves specifically for a piece type targeting a destination.
-  Used for fast SAN parsing.
+  Generates only capturing moves (for Quiescence Search).
   """
+  def captures(game) do
+    generate_captures_int(game)
+    |> Enum.map(&Move.to_struct/1)
+  end
+
+  @doc """
+  Generates only non-capturing (quiet) moves.
+  """
+  def quiets(game) do
+    generate_quiets_int(game)
+    |> Enum.map(&Move.to_struct/1)
+  end
+
+  # Internal integer generators
+  defp generate_captures_int(%Game{board: board, turn: turn} = game) do
+    board_tuple = if is_tuple(board), do: board, else: Board.from_struct(board)
+
+    us_bb =
+      if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
+
+    them_bb =
+      if turn == :white, do: Board.black_occ(board_tuple), else: Board.white_occ(board_tuple)
+
+    # For captures, target must be 'them_bb' (plus EP)
+
+    generate_pawn_captures([], Board.wp(board_tuple), turn, them_bb, game.en_passant)
+    |> generate_pawn_captures_only(board_tuple, turn, them_bb, game.en_passant)
+    |> generate_knight_moves(board_tuple, turn, us_bb, them_bb)
+    |> generate_sliding_moves(
+      :bishop,
+      board_tuple,
+      turn,
+      us_bb,
+      Board.all_occ(board_tuple),
+      them_bb
+    )
+    |> generate_sliding_moves(
+      :rook,
+      board_tuple,
+      turn,
+      us_bb,
+      Board.all_occ(board_tuple),
+      them_bb
+    )
+    |> generate_sliding_moves(
+      :queen,
+      board_tuple,
+      turn,
+      us_bb,
+      Board.all_occ(board_tuple),
+      them_bb
+    )
+    |> generate_king_moves(board_tuple, turn, us_bb, game, them_bb)
+
+    # King captures only (no castling)
+  end
+
+  defp generate_quiets_int(%Game{board: board, turn: turn} = game) do
+    board_tuple = if is_tuple(board), do: board, else: Board.from_struct(board)
+
+    us_bb =
+      if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
+
+    all_bb = Board.all_occ(board_tuple)
+    # Target mask for quiets
+    empty_bb = bnot(all_bb)
+
+    []
+    |> generate_pawn_quiets(board_tuple, turn, all_bb)
+    |> generate_knight_moves(board_tuple, turn, us_bb, empty_bb)
+    |> generate_sliding_moves(:bishop, board_tuple, turn, us_bb, all_bb, empty_bb)
+    |> generate_sliding_moves(:rook, board_tuple, turn, us_bb, all_bb, empty_bb)
+    |> generate_sliding_moves(:queen, board_tuple, turn, us_bb, all_bb, empty_bb)
+    |> generate_king_moves(board_tuple, turn, us_bb, game, empty_bb)
+    # Add castling here? Yes, castling is a quiet move.
+    # Only works if King mask correct
+    |> generate_castling_moves(Board.wk(board_tuple), turn, game)
+  end
+
   def generate_moves_targeting(game, target_sq, piece_type) do
     board = game.board
     turn = game.turn
@@ -76,22 +154,69 @@ defmodule Echecs.MoveGen do
     bitboard_to_moves_to(bb &&& bb - 1, to, [Move.pack(from, to, nil, nil) | acc])
   end
 
+  defp bitboard_to_moves_from(0, _, acc), do: acc
+
+  defp bitboard_to_moves_from(bb, from, acc) do
+    to = Helper.lsb(bb)
+    bitboard_to_moves_from(bb &&& bb - 1, from, [Move.pack(from, to, nil, nil) | acc])
+  end
+
   defp generate_pseudo_moves_int(%Game{board: board, turn: turn} = game) do
-    us_bb = if turn == :white, do: board.white_pieces, else: board.black_pieces
-    them_bb = if turn == :white, do: board.black_pieces, else: board.white_pieces
-    all_bb = board.all_pieces
+    board_tuple = if is_tuple(board), do: board, else: Board.from_struct(board)
+
+    us_bb =
+      if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
+
+    them_bb =
+      if turn == :white, do: Board.black_occ(board_tuple), else: Board.white_occ(board_tuple)
+
+    all_bb = Board.all_occ(board_tuple)
+    target_mask = bnot(us_bb)
 
     []
-    |> generate_pawn_moves(board, turn, them_bb, all_bb, game.en_passant)
-    |> generate_knight_moves(board, turn, us_bb)
-    |> generate_sliding_moves(:bishop, board, turn, us_bb, all_bb)
-    |> generate_sliding_moves(:rook, board, turn, us_bb, all_bb)
-    |> generate_sliding_moves(:queen, board, turn, us_bb, all_bb)
-    |> generate_king_moves(board, turn, us_bb, game)
+    |> generate_pawn_moves(board_tuple, turn, them_bb, all_bb, game.en_passant)
+    |> generate_knight_moves(board_tuple, turn, us_bb, target_mask)
+    |> generate_sliding_moves(:bishop, board_tuple, turn, us_bb, all_bb, target_mask)
+    |> generate_sliding_moves(:rook, board_tuple, turn, us_bb, all_bb, target_mask)
+    |> generate_sliding_moves(:queen, board_tuple, turn, us_bb, all_bb, target_mask)
+    |> generate_king_moves(board_tuple, turn, us_bb, game, target_mask)
+    |> generate_castling_moves(
+      if(turn == :white, do: Board.wk(board_tuple), else: Board.bk(board_tuple)),
+      turn,
+      game
+    )
+  end
+
+  defp generate_pawn_captures_only(acc, board, :white, them_bb, ep_sq) do
+    generate_pawn_captures(acc, Board.wp(board), :white, them_bb, ep_sq)
+  end
+
+  defp generate_pawn_captures_only(acc, board, :black, them_bb, ep_sq) do
+    generate_pawn_captures(acc, Board.bp(board), :black, them_bb, ep_sq)
+  end
+
+  defp generate_pawn_quiets(acc, board, :white, all_bb) do
+    pawns = Board.wp(board)
+    single_pushes = pawns >>> 8 &&& bnot(all_bb)
+    acc = extract_pawn_moves(single_pushes, 8, :white, acc)
+
+    rank_3_mask = 0x0000FF0000000000
+    double_pushes = (single_pushes &&& rank_3_mask) >>> 8 &&& bnot(all_bb)
+    extract_pawn_double_moves(double_pushes, 16, acc)
+  end
+
+  defp generate_pawn_quiets(acc, board, :black, all_bb) do
+    pawns = Board.bp(board)
+    single_pushes = pawns <<< 8 &&& bnot(all_bb)
+    acc = extract_pawn_moves(single_pushes, -8, :black, acc)
+
+    rank_6_mask = 0x0000000000FF0000
+    double_pushes = (single_pushes &&& rank_6_mask) <<< 8 &&& bnot(all_bb)
+    extract_pawn_double_moves(double_pushes, -16, acc)
   end
 
   defp generate_pawn_moves(acc, board, :white, them_bb, all_bb, ep_sq) do
-    pawns = board.white_pawns
+    pawns = Board.wp(board)
     single_pushes = pawns >>> 8 &&& bnot(all_bb)
     acc = extract_pawn_moves(single_pushes, 8, :white, acc)
 
@@ -103,7 +228,7 @@ defmodule Echecs.MoveGen do
   end
 
   defp generate_pawn_moves(acc, board, :black, them_bb, all_bb, ep_sq) do
-    pawns = board.black_pawns
+    pawns = Board.bp(board)
     single_pushes = pawns <<< 8 &&& bnot(all_bb)
     acc = extract_pawn_moves(single_pushes, -8, :black, acc)
 
@@ -310,83 +435,70 @@ defmodule Echecs.MoveGen do
   defp create_pawn_move(from, to, true), do: Move.pack(from, to, nil, :en_passant)
   defp create_pawn_move(from, to, false), do: Move.pack(from, to, nil, nil)
 
-  defp generate_knight_moves(acc, board, turn, us_bb) do
-    knights = if turn == :white, do: board.white_knights, else: board.black_knights
-    do_generate_knight_moves(knights, acc, us_bb)
+  defp generate_knight_moves(acc, board, turn, us_bb, target_mask) do
+    knights = if turn == :white, do: Board.wn(board), else: Board.bn(board)
+    do_generate_knight_moves(knights, acc, us_bb, target_mask)
   end
 
-  defp do_generate_knight_moves(0, acc, _), do: acc
+  defp do_generate_knight_moves(0, acc, _, _), do: acc
 
-  defp do_generate_knight_moves(knights, acc, us_bb) do
+  defp do_generate_knight_moves(knights, acc, us_bb, target_mask) do
     from = Helper.lsb(knights)
     attacks = Precomputed.get_knight_attacks(from)
-    valid_moves = attacks &&& bnot(us_bb)
+    # Mask attacks by target_mask (captures or quiets) AND not self-capture (bnot us_bb)
+    # Actually target_mask usually already excludes self-capture if set correctly.
+    # But for safety:
+    valid_moves = attacks &&& target_mask
 
     acc = bitboard_to_moves_from(valid_moves, from, acc)
-    do_generate_knight_moves(knights &&& knights - 1, acc, us_bb)
+    do_generate_knight_moves(knights &&& knights - 1, acc, us_bb, target_mask)
   end
 
-  defp bitboard_to_moves_from(0, _, acc), do: acc
-
-  defp bitboard_to_moves_from(bb, from, acc) do
-    to = Helper.lsb(bb)
-    bitboard_to_moves_from(bb &&& bb - 1, from, [Move.pack(from, to, nil, nil) | acc])
-  end
-
-  defp generate_sliding_moves(acc, type, board, turn, us_bb, all_bb) do
+  defp generate_sliding_moves(acc, type, board, turn, us_bb, all_bb, target_mask) do
     bb = get_slider_bb(board, turn, type)
-    do_generate_sliding_moves(bb, acc, type, us_bb, all_bb)
+    do_generate_sliding_moves(bb, acc, type, us_bb, all_bb, target_mask)
   end
 
-  defp do_generate_sliding_moves(0, acc, _, _, _), do: acc
+  defp do_generate_sliding_moves(0, acc, _, _, _, _), do: acc
 
-  defp do_generate_sliding_moves(bb, acc, type, us_bb, all_bb) do
+  defp do_generate_sliding_moves(bb, acc, type, us_bb, all_bb, target_mask) do
     from = Helper.lsb(bb)
     attacks = get_slider_attacks(type, from, all_bb)
-    valid_moves = attacks &&& bnot(us_bb)
+    valid_moves = attacks &&& target_mask
 
     acc = bitboard_to_moves_from(valid_moves, from, acc)
-    do_generate_sliding_moves(bb &&& bb - 1, acc, type, us_bb, all_bb)
+    do_generate_sliding_moves(bb &&& bb - 1, acc, type, us_bb, all_bb, target_mask)
   end
 
-  defp get_slider_bb(board, :white, :bishop), do: board.white_bishops
-  defp get_slider_bb(board, :white, :rook), do: board.white_rooks
-  defp get_slider_bb(board, :white, :queen), do: board.white_queens
-  defp get_slider_bb(board, :black, :bishop), do: board.black_bishops
-  defp get_slider_bb(board, :black, :rook), do: board.black_rooks
-  defp get_slider_bb(board, :black, :queen), do: board.black_queens
-
-  defp get_slider_attacks(:bishop, from, all_bb), do: Magic.get_bishop_attacks(from, all_bb)
-  defp get_slider_attacks(:rook, from, all_bb), do: Magic.get_rook_attacks(from, all_bb)
-
-  defp get_slider_attacks(:queen, from, all_bb),
-    do: Magic.get_bishop_attacks(from, all_bb) ||| Magic.get_rook_attacks(from, all_bb)
-
-  defp generate_king_moves(acc, board, turn, us_bb, game) do
-    king_bb = if turn == :white, do: board.white_king, else: board.black_king
+  defp generate_king_moves(acc, board, turn, _us_bb, _game, target_mask) do
+    king_bb = if turn == :white, do: Board.wk(board), else: Board.bk(board)
 
     if king_bb == 0 do
       acc
     else
       king_sq = Helper.lsb(king_bb)
       attacks = Precomputed.get_king_attacks(king_sq)
-      valid_moves = attacks &&& bnot(us_bb)
+      valid_moves = attacks &&& target_mask
 
-      acc = bitboard_to_moves_from(valid_moves, king_sq, acc)
-      generate_castling_moves(acc, king_sq, turn, game)
+      bitboard_to_moves_from(valid_moves, king_sq, acc)
     end
   end
 
-  defp generate_castling_moves(acc, king_sq, turn, game) do
-    rights = Map.get(game.castling, turn, [])
-    opponent = Piece.opponent(turn)
-
-    if Game.in_check?(game) do
+  defp generate_castling_moves(acc, king_bb, turn, game) do
+    if king_bb == 0 do
       acc
     else
-      acc
-      |> check_castling(:kingside, rights, king_sq, turn, game, opponent)
-      |> check_castling(:queenside, rights, king_sq, turn, game, opponent)
+      king_sq = Helper.lsb(king_bb)
+      rights = Map.get(game.castling, turn, [])
+      opponent = Piece.opponent(turn)
+
+      if Game.in_check?(game) do
+        acc
+      else
+        acc
+        |> check_castling(:kingside, rights, king_sq, turn, game, opponent)
+        |> check_castling(:queenside, rights, king_sq, turn, game, opponent)
+      end
     end
   end
 
@@ -444,17 +556,22 @@ defmodule Echecs.MoveGen do
   end
 
   defp legal_int?(game, move_int) do
-    board = Board.make_move_on_bitboards(game.board, move_int, game.turn)
+    board_tuple = if is_tuple(game.board), do: game.board, else: Board.from_struct(game.board)
 
-    king_bb = if game.turn == :white, do: board.white_king, else: board.black_king
+    board = Board.make_move_on_board_tuple(board_tuple, move_int, game.turn)
+
+    king_bb = if game.turn == :white, do: Board.wk(board), else: Board.bk(board)
     king_sq = Helper.lsb(king_bb)
 
-    if king_sq do
-      opponent = Piece.opponent(game.turn)
-      not Board.attacked?(board, king_sq, opponent)
-    else
-      false
-    end
+    res =
+      if king_sq do
+        opponent = Piece.opponent(game.turn)
+        not Board.attacked_tuple?(board, king_sq, opponent)
+      else
+        false
+      end
+
+    res
   end
 
   defp get_bb_key(:white, :pawn), do: :white_pawns
@@ -469,4 +586,17 @@ defmodule Echecs.MoveGen do
   defp get_bb_key(:black, :rook), do: :black_rooks
   defp get_bb_key(:black, :queen), do: :black_queens
   defp get_bb_key(:black, :king), do: :black_king
+
+  defp get_slider_bb(board, :white, :bishop), do: Board.wb(board)
+  defp get_slider_bb(board, :white, :rook), do: Board.wr(board)
+  defp get_slider_bb(board, :white, :queen), do: Board.wq(board)
+  defp get_slider_bb(board, :black, :bishop), do: Board.bb(board)
+  defp get_slider_bb(board, :black, :rook), do: Board.br(board)
+  defp get_slider_bb(board, :black, :queen), do: Board.bq(board)
+
+  defp get_slider_attacks(:bishop, from, all_bb), do: Magic.get_bishop_attacks(from, all_bb)
+  defp get_slider_attacks(:rook, from, all_bb), do: Magic.get_rook_attacks(from, all_bb)
+
+  defp get_slider_attacks(:queen, from, all_bb),
+    do: Magic.get_bishop_attacks(from, all_bb) ||| Magic.get_rook_attacks(from, all_bb)
 end
