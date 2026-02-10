@@ -22,7 +22,8 @@ defmodule Echecs.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {Echecs.Application, []}
     ]
   end
 
@@ -31,6 +32,7 @@ defmodule Echecs.MixProject do
     [
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:git_hooks, "~> 0.7.3", only: [:dev], runtime: false},
       {:exprof, "~> 0.2.0", only: :dev},
       {:nimble_parsec, "~> 1.4"}
     ]
