@@ -3,14 +3,14 @@ defmodule Echecs.Bitboard.MagicGenerator do
   Generates Magic Numbers and Attack Tables for Sliding Pieces (Rook, Bishop).
   """
   import Bitwise
-  alias Echecs.Bitboard.Helper
+  alias Echecs.Bitboard.{Helper, Magic}
 
   @doc """
   Pre-computes magic bitboards and saves them to cache.
   Called from Mix task or startup.
   """
   def init do
-    Echecs.Bitboard.Magic.init()
+    Magic.init()
   end
 
   @doc """
