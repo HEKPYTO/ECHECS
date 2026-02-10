@@ -7,6 +7,83 @@ defmodule Echecs.Board do
   require Echecs.Bitboard.Constants
   alias Echecs.Bitboard.{Constants, Magic, Precomputed}
 
+  # 0: white_pawns, 1: white_knights, 2: white_bishops, 3: white_rooks, 4: white_queens, 5: white_king
+  # 6: black_pawns, 7: black_knights, 8: black_bishops, 9: black_rooks, 10: black_queens, 11: black_king
+  # 12: white_pieces, 13: black_pieces, 14: all_pieces
+
+  @type board_tuple :: {
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer(),
+          integer()
+        }
+
+  # Helper to access tuple elements by index
+  @compile {:inline,
+            wp: 1,
+            wn: 1,
+            wb: 1,
+            wr: 1,
+            wq: 1,
+            wk: 1,
+            bp: 1,
+            bn: 1,
+            bb: 1,
+            br: 1,
+            bq: 1,
+            bk: 1,
+            white_occ: 1,
+            black_occ: 1,
+            all_occ: 1}
+
+  def wp(board), do: elem(board, 0)
+  def wn(board), do: elem(board, 1)
+  def wb(board), do: elem(board, 2)
+  def wr(board), do: elem(board, 3)
+  def wq(board), do: elem(board, 4)
+  def wk(board), do: elem(board, 5)
+  def bp(board), do: elem(board, 6)
+  def bn(board), do: elem(board, 7)
+  def bb(board), do: elem(board, 8)
+  def br(board), do: elem(board, 9)
+  def bq(board), do: elem(board, 10)
+  def bk(board), do: elem(board, 11)
+  def white_occ(board), do: elem(board, 12)
+  def black_occ(board), do: elem(board, 13)
+  def all_occ(board), do: elem(board, 14)
+
+  def new_tuple do
+    # Initial board state as a tuple
+    {
+      Constants.rank_2(),
+      0x42 <<< 56,
+      0x24 <<< 56,
+      0x81 <<< 56,
+      0x08 <<< 56,
+      0x10 <<< 56,
+      Constants.rank_7(),
+      0x42,
+      0x24,
+      0x81,
+      0x08,
+      0x10,
+      0xFFFF <<< 48,
+      0xFFFF,
+      0xFFFF00000000FFFF
+    }
+  end
+
   defstruct white_pawns: 0,
             white_knights: 0,
             white_bishops: 0,
@@ -33,12 +110,57 @@ defmodule Echecs.Board do
     |> update_aggregates()
   end
 
+  def to_struct(tuple) do
+    struct(
+      __MODULE__,
+      white_pawns: elem(tuple, 0),
+      white_knights: elem(tuple, 1),
+      white_bishops: elem(tuple, 2),
+      white_rooks: elem(tuple, 3),
+      white_queens: elem(tuple, 4),
+      white_king: elem(tuple, 5),
+      black_pawns: elem(tuple, 6),
+      black_knights: elem(tuple, 7),
+      black_bishops: elem(tuple, 8),
+      black_rooks: elem(tuple, 9),
+      black_queens: elem(tuple, 10),
+      black_king: elem(tuple, 11),
+      white_pieces: elem(tuple, 12),
+      black_pieces: elem(tuple, 13),
+      all_pieces: elem(tuple, 14)
+    )
+  end
+
+  def from_struct(struct) do
+    {
+      struct.white_pawns,
+      struct.white_knights,
+      struct.white_bishops,
+      struct.white_rooks,
+      struct.white_queens,
+      struct.white_king,
+      struct.black_pawns,
+      struct.black_knights,
+      struct.black_bishops,
+      struct.black_rooks,
+      struct.black_queens,
+      struct.black_king,
+      struct.white_pieces,
+      struct.black_pieces,
+      struct.all_pieces
+    }
+  end
+
   @doc """
   Returns true if the square `sq` is attacked by `attacker_color`.
   """
   def attacked?(board, sq, attacker_color) do
-    non_sliding_attacked?(board, sq, attacker_color) or
-      sliding_attacked?(board, sq, attacker_color)
+    if is_tuple(board) do
+      attacked_tuple?(board, sq, attacker_color)
+    else
+      non_sliding_attacked?(board, sq, attacker_color) or
+        sliding_attacked?(board, sq, attacker_color)
+    end
   end
 
   defp non_sliding_attacked?(board, sq, attacker_color) do
@@ -92,10 +214,189 @@ defmodule Echecs.Board do
 
   require Echecs.Move
 
+  def attacked_tuple?(board, sq, attacker_color) do
+    non_sliding_attacked_tuple?(board, sq, attacker_color) or
+      sliding_attacked_tuple?(board, sq, attacker_color)
+  end
+
+  defp non_sliding_attacked_tuple?(board, sq, attacker_color) do
+    pawn_attacked_tuple?(board, sq, attacker_color) or
+      knight_attacked_tuple?(board, sq, attacker_color) or
+      king_attacked_tuple?(board, sq, attacker_color)
+  end
+
+  defp pawn_attacked_tuple?(board, sq, attacker_color) do
+    defender_color = if attacker_color == :white, do: :black, else: :white
+    pawn_mask = Precomputed.get_pawn_attacks(sq, defender_color)
+    pawns = if attacker_color == :white, do: wp(board), else: bp(board)
+    (pawn_mask &&& pawns) != 0
+  end
+
+  defp knight_attacked_tuple?(board, sq, attacker_color) do
+    knight_mask = Precomputed.get_knight_attacks(sq)
+    knights = if attacker_color == :white, do: wn(board), else: bn(board)
+    (knight_mask &&& knights) != 0
+  end
+
+  defp king_attacked_tuple?(board, sq, attacker_color) do
+    king_mask = Precomputed.get_king_attacks(sq)
+    kings = if attacker_color == :white, do: wk(board), else: bk(board)
+    (king_mask &&& kings) != 0
+  end
+
+  defp sliding_attacked_tuple?(board, sq, attacker_color) do
+    bishop_mask = Magic.get_bishop_attacks(sq, all_occ(board))
+
+    bishops_queens =
+      if attacker_color == :white,
+        do: wb(board) ||| wq(board),
+        else: bb(board) ||| bq(board)
+
+    diag_hit = (bishop_mask &&& bishops_queens) != 0
+
+    if diag_hit do
+      true
+    else
+      rook_mask = Magic.get_rook_attacks(sq, all_occ(board))
+
+      rooks_queens =
+        if attacker_color == :white,
+          do: wr(board) ||| wq(board),
+          else: br(board) ||| bq(board)
+
+      (rook_mask &&& rooks_queens) != 0
+    end
+  end
+
   @doc """
   Applies a move to the bitboards only. Used for fast legality checking.
   Returns the updated board struct.
   """
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  def make_move_on_board_tuple(board, move, turn) do
+    from = Echecs.Move.unpack_from(move)
+    to = Echecs.Move.unpack_to(move)
+    promotion = Echecs.Move.unpack_promotion(move)
+    special = Echecs.Move.unpack_special(move)
+
+    from_mask = 1 <<< from
+    to_mask = 1 <<< to
+
+    # We need fast type lookup on tuple
+    piece_type = find_piece_type_on_tuple(board, turn, from_mask)
+
+    # 1. Update mover
+    board =
+      if promotion do
+        board
+        |> update_tuple(turn, piece_type, from_mask, :clear)
+        |> update_tuple(turn, promotion, to_mask, :set)
+      else
+        move_mask = from_mask ||| to_mask
+        update_tuple(board, turn, piece_type, move_mask, :xor)
+      end
+
+    # 2. Update capture
+    opponent = if turn == :white, do: :black, else: :white
+
+    board =
+      cond do
+        special == :en_passant ->
+          cap_sq = if turn == :white, do: to + 8, else: to - 8
+          update_tuple(board, opponent, :pawn, 1 <<< cap_sq, :clear)
+
+        (elem(board, 14) &&& to_mask) != 0 ->
+          captured_type = find_piece_type_on_tuple(board, opponent, to_mask)
+
+          if captured_type do
+            update_tuple(board, opponent, captured_type, to_mask, :clear)
+          else
+            board
+          end
+
+        true ->
+          board
+      end
+
+    # 3. Handle Castling
+    board =
+      if special in [:kingside_castle, :queenside_castle] do
+        {r_from, r_to} =
+          case {special, turn} do
+            {:kingside_castle, :white} -> {63, 61}
+            {:queenside_castle, :white} -> {56, 59}
+            {:kingside_castle, :black} -> {7, 5}
+            {:queenside_castle, :black} -> {0, 3}
+          end
+
+        r_mask = 1 <<< r_from ||| 1 <<< r_to
+        update_tuple(board, turn, :rook, r_mask, :xor)
+      else
+        board
+      end
+
+    update_tuple_aggregates(board)
+  end
+
+  defp update_tuple(board, color, type, mask, op) do
+    idx = tuple_index(color, type)
+    val = elem(board, idx)
+    new_val = apply_op(val, mask, op)
+    put_elem(board, idx, new_val)
+  end
+
+  defp tuple_index(:white, :pawn), do: 0
+  defp tuple_index(:white, :knight), do: 1
+  defp tuple_index(:white, :bishop), do: 2
+  defp tuple_index(:white, :rook), do: 3
+  defp tuple_index(:white, :queen), do: 4
+  defp tuple_index(:white, :king), do: 5
+  defp tuple_index(:black, :pawn), do: 6
+  defp tuple_index(:black, :knight), do: 7
+  defp tuple_index(:black, :bishop), do: 8
+  defp tuple_index(:black, :rook), do: 9
+  defp tuple_index(:black, :queen), do: 10
+  defp tuple_index(:black, :king), do: 11
+
+  defp find_piece_type_on_tuple(board, :white, mask) do
+    cond do
+      (elem(board, 0) &&& mask) != 0 -> :pawn
+      (elem(board, 1) &&& mask) != 0 -> :knight
+      (elem(board, 2) &&& mask) != 0 -> :bishop
+      (elem(board, 3) &&& mask) != 0 -> :rook
+      (elem(board, 4) &&& mask) != 0 -> :queen
+      (elem(board, 5) &&& mask) != 0 -> :king
+      true -> nil
+    end
+  end
+
+  defp find_piece_type_on_tuple(board, :black, mask) do
+    cond do
+      (elem(board, 6) &&& mask) != 0 -> :pawn
+      (elem(board, 7) &&& mask) != 0 -> :knight
+      (elem(board, 8) &&& mask) != 0 -> :bishop
+      (elem(board, 9) &&& mask) != 0 -> :rook
+      (elem(board, 10) &&& mask) != 0 -> :queen
+      (elem(board, 11) &&& mask) != 0 -> :king
+      true -> nil
+    end
+  end
+
+  defp update_tuple_aggregates(board) do
+    white =
+      elem(board, 0) ||| elem(board, 1) ||| elem(board, 2) |||
+        elem(board, 3) ||| elem(board, 4) ||| elem(board, 5)
+
+    black =
+      elem(board, 6) ||| elem(board, 7) ||| elem(board, 8) |||
+        elem(board, 9) ||| elem(board, 10) ||| elem(board, 11)
+
+    board
+    |> put_elem(12, white)
+    |> put_elem(13, black)
+    |> put_elem(14, white ||| black)
+  end
+
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def make_move_on_bitboards(board, move, turn) do
     from = Echecs.Move.unpack_from(move)
@@ -176,7 +477,7 @@ defmodule Echecs.Board do
   end
 
   def from_tuple(mailbox) when is_tuple(mailbox) and tuple_size(mailbox) == 64 do
-    initial = %__MODULE__{}
+    initial = struct(__MODULE__)
 
     0..63
     |> Enum.reduce(initial, fn idx, board ->
