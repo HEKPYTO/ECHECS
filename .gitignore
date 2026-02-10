@@ -13,6 +13,9 @@
 # Temporary files, for example, from tests.
 /tmp/
 
+# Generated assets and artifacts
+/priv/
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 
@@ -36,3 +39,11 @@ package.json
 package-lock.json
 npm-debug.log
 test/comparison/
+/_build
+/deps
+/.elixir_ls
+/cover
+
+# Ignore all markdown files except README.md
+*.md
+!README.md

@@ -23,8 +23,8 @@ defmodule Echecs.Integration.LichessDBTest do
       IO.puts("Found local file: #{file_path}")
       IO.puts("Starting processing... (This may take a while)")
 
-      env_sample = System.get_env("SAMPLE_SIZE")
-      sample_size = if env_sample, do: String.to_integer(env_sample), else: 1_000_000
+      # Fixed to 1,000,000 games as requested
+      sample_size = 1_000_000
 
       IO.puts("Processing sample of #{sample_size} games...")
 
