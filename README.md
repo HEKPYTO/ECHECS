@@ -6,7 +6,7 @@
 
 Echecs is a robust chess library designed for speed and correctness. It leverages advanced optimization techniques available on the BEAM virtual machine, making it suitable for high-throughput analysis and scalable applications.
 
-## 🚀 Features
+## Features
 
 *   **High Performance**: Process over **4,000 games per second** (benchmarked on M1 Pro).
 *   **Pure Elixir**: No NIFs or external dependencies (C/Rust) required for core logic.
@@ -20,7 +20,7 @@ Echecs is a robust chess library designed for speed and correctness. It leverage
     *   **PGN**: Parsing and replay support for standard chess games.
 *   **Complete Rule Implementation**: Castling, En Passant, Promotion, 50-move rule, and 3-fold repetition.
 
-## 📦 Installation
+## Installation
 
 Add `echecs` to your list of dependencies in `mix.exs`:
 
@@ -32,7 +32,7 @@ def deps do
 end
 ```
 
-## ⚡ Quick Start
+## Quick Start
 
 ### Basic Game Loop
 
@@ -63,7 +63,7 @@ game = Echecs.new_game("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c
 Echecs.FEN.to_string(game)
 ```
 
-## 🛠 Testing & Benchmarks
+## Testing & Benchmarks
 
 The engine is verified against millions of real-world games from the Lichess database to ensure correctness and stability.
 
@@ -83,7 +83,7 @@ LICHESS_DB_PATH=path/to/file.pgn.zst mix test --include integration test/integra
 
 *Current Benchmark:* ~254s for 1,000,000 games (~3,924 games/sec).
 
-## 🐳 Docker Support
+## Docker Support
 
 Deploy or test in a consistent environment using the provided Docker image.
 
@@ -96,6 +96,6 @@ docker run -it --rm echecs
 iex> Echecs.new_game()
 ```
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License.
