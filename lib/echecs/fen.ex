@@ -35,6 +35,7 @@ defmodule Echecs.FEN do
     rows
     |> Enum.flat_map(&parse_row/1)
     |> List.to_tuple()
+    |> Board.from_tuple()
   end
 
   defp parse_row(row) do

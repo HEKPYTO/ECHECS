@@ -10,17 +10,11 @@ defmodule Echecs.PGN do
   """
   def parse_moves(pgn_body) do
     pgn_body
-    # Remove comments
     |> String.replace(~r/\{.*?\}/, "")
-    # Remove variations
     |> String.replace(~r/\(.*\)/, "")
-    # Remove move numbers (including 1... style)
     |> String.replace(~r/\d+\.+/, "")
-    # Remove result
     |> String.replace(~r/(1-0|0-1|1\/2-1\/2|\*)/, "")
-    # Remove nags
     |> String.replace(~r/[\?!]+/, "")
-    # Normalize spaces
     |> String.replace(~r/\s+/, " ")
     |> String.trim()
     |> String.split(" ")
@@ -66,12 +60,6 @@ defmodule Echecs.PGN do
   end
 
   defp parse_standard_san(game, san) do
-    # Regex to capture:
-    # 1. Piece (optional, default P)
-    # 2. Disambiguation (file/rank, optional)
-    # 3. Capture (x, optional)
-    # 4. Target square
-    # 5. Promotion (=Q, optional)
     regex = ~r/^([NBRQK])?([a-h1-8]{0,2})?(x)?([a-h][1-8])(=[NBRQ])?$/
 
     case Regex.run(regex, san) do

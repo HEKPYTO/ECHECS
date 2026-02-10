@@ -3,7 +3,9 @@ defmodule Echecs.Game do
   Holds the complete state of a chess game.
   """
 
+  alias Echecs.Bitboard.Helper
   alias Echecs.{Board, FEN, Move, MoveGen, Piece}
+  import Bitwise
 
   @type castling_side :: :kingside | :queenside
   @type castling_rights :: %{white: [castling_side()], black: [castling_side()]}
@@ -15,8 +17,8 @@ defmodule Echecs.Game do
           en_passant: Board.square() | nil,
           halfmove: non_neg_integer(),
           fullmove: pos_integer(),
-          # Can be hash or struct
           history: [any()],
+          zobrist_hash: non_neg_integer(),
           king_pos: %{white: Board.square() | nil, black: Board.square() | nil}
         }
 
@@ -27,6 +29,7 @@ defmodule Echecs.Game do
             halfmove: 0,
             fullmove: 1,
             history: [],
+            zobrist_hash: 0,
             king_pos: %{white: 60, black: 4}
 
   @start_fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -70,7 +73,16 @@ defmodule Echecs.Game do
     fullmove = if game.turn == :black, do: game.fullmove + 1, else: game.fullmove
     king_pos = update_king_pos(game.king_pos, piece, move.to, game.turn)
 
-    state_hash = {board, next_turn, castling, en_passant}
+    new_hash =
+      Echecs.Zobrist.update_hash(
+        game.zobrist_hash,
+        move,
+        piece,
+        target_piece,
+        {game.castling, castling},
+        {game.en_passant, en_passant},
+        game.turn
+      )
 
     %__MODULE__{
       game
@@ -80,7 +92,8 @@ defmodule Echecs.Game do
         en_passant: en_passant,
         halfmove: halfmove,
         fullmove: fullmove,
-        history: [state_hash | game.history],
+        history: [game.zobrist_hash | game.history],
+        zobrist_hash: new_hash,
         king_pos: king_pos
     }
   end
@@ -131,13 +144,9 @@ defmodule Echecs.Game do
 
   defp update_piece(piece, _), do: piece
 
-  # h1 -> f1
   defp castling_rook_move(:kingside_castle, :white), do: {63, 61}
-  # a1 -> d1
   defp castling_rook_move(:queenside_castle, :white), do: {56, 59}
-  # h8 -> f8
   defp castling_rook_move(:kingside_castle, :black), do: {7, 5}
-  # a8 -> d8
   defp castling_rook_move(:queenside_castle, :black), do: {0, 3}
 
   defp update_castling_rights(castling, {color, type}, from, target_piece, to) do
@@ -210,89 +219,7 @@ defmodule Echecs.Game do
   end
 
   def attacked?(game, sq, attacker_color) do
-    knight_attacks?(game.board, sq, attacker_color) or
-      sliding_attacks?(game.board, sq, attacker_color) or
-      pawn_attacks?(game.board, sq, attacker_color) or
-      king_attacks?(game.board, sq, attacker_color)
-  end
-
-  defp knight_attacks?(board, sq, color) do
-    offsets = [-17, -15, -10, -6, 6, 10, 15, 17]
-
-    Enum.any?(offsets, fn offset ->
-      target = sq + offset
-
-      target in 0..63 and
-        check_piece(board, target, color, :knight) and
-        knight_jump?(sq, target)
-    end)
-  end
-
-  defp knight_jump?(sq1, sq2) do
-    abs(div(sq1, 8) - div(sq2, 8)) + abs(rem(sq1, 8) - rem(sq2, 8)) == 3
-  end
-
-  defp sliding_attacks?(board, sq, color) do
-    slide_check(board, sq, [-8, -1, 1, 8], color, [:rook, :queen]) or
-      slide_check(board, sq, [-9, -7, 7, 9], color, [:bishop, :queen])
-  end
-
-  defp slide_check(board, start, offsets, color, types) do
-    Enum.any?(offsets, fn offset ->
-      check_direction(board, start, offset, color, types)
-    end)
-  end
-
-  defp check_direction(board, start, offset, color, types) do
-    Stream.iterate(start + offset, &(&1 + offset))
-    |> Stream.take_while(fn idx ->
-      idx in 0..63 and abs(rem(idx, 8) - rem(idx - offset, 8)) <= 1
-    end)
-    |> Enum.reduce_while(false, &check_square(&1, &2, board, color, types))
-  end
-
-  defp check_square(idx, _, board, color, types) do
-    case Board.at(board, idx) do
-      nil ->
-        {:cont, false}
-
-      {^color, type} ->
-        if type in types, do: {:halt, true}, else: {:halt, false}
-
-      _ ->
-        {:halt, false}
-    end
-  end
-
-  defp pawn_attacks?(board, sq, color) do
-    offsets = if color == :white, do: [7, 9], else: [-9, -7]
-
-    Enum.any?(offsets, fn offset ->
-      target = sq + offset
-
-      target in 0..63 and
-        abs(rem(sq, 8) - rem(target, 8)) == 1 and
-        check_piece(board, target, color, :pawn)
-    end)
-  end
-
-  defp king_attacks?(board, sq, color) do
-    offsets = [-9, -8, -7, -1, 1, 7, 8, 9]
-
-    Enum.any?(offsets, fn offset ->
-      target = sq + offset
-
-      target in 0..63 and
-        abs(rem(sq, 8) - rem(target, 8)) <= 1 and
-        check_piece(board, target, color, :king)
-    end)
-  end
-
-  defp check_piece(board, idx, color, type) do
-    case Board.at(board, idx) do
-      {^color, ^type} -> true
-      _ -> false
-    end
+    Board.attacked?(game.board, sq, attacker_color)
   end
 
   @doc """
@@ -323,42 +250,55 @@ defmodule Echecs.Game do
   defp fifty_move_rule?(game), do: game.halfmove >= 100
 
   defp repetition?(game) do
-    current_state = {game.board, game.turn, game.castling, game.en_passant}
+    current_hash = game.zobrist_hash
 
-    count = Enum.count(game.history, fn state -> state == current_state end)
-    count >= 3
+    Enum.count(game.history, &(&1 == current_hash)) >= 2
   end
 
   defp insufficient_material?(game) do
-    pieces =
-      game.board
-      |> Tuple.to_list()
-      |> Enum.with_index()
-      |> Enum.reject(fn {p, _} -> is_nil(p) end)
-      |> Enum.map(fn {{c, t}, i} -> {c, t, i} end)
-
-    count = length(pieces)
+    board = game.board
+    all_pieces = board.all_pieces
+    count = Helper.pop_count(all_pieces)
 
     cond do
       count == 2 ->
         true
 
       count == 3 ->
-        Enum.any?(pieces, fn {_, t, _} -> t in [:bishop, :knight] end)
+        majors =
+          board.white_rooks ||| board.white_queens ||| board.white_pawns |||
+            board.black_rooks ||| board.black_queens ||| board.black_pawns
+
+        majors == 0
 
       count == 4 ->
-        bishops = Enum.filter(pieces, fn {_, t, _} -> t == :bishop end)
+        others =
+          board.white_rooks ||| board.white_queens ||| board.white_pawns ||| board.white_knights |||
+            board.black_rooks ||| board.black_queens ||| board.black_pawns ||| board.black_knights
 
-        if length(bishops) == 2 do
-          [{c1, _, i1}, {c2, _, i2}] = bishops
-
-          c1 != c2 and square_color(i1) == square_color(i2)
+        if others == 0 do
+          check_bishops_same_color(board)
         else
           false
         end
 
       true ->
         false
+    end
+  end
+
+  defp check_bishops_same_color(board) do
+    if Helper.pop_count(board.white_bishops) == 1 and
+         Helper.pop_count(board.black_bishops) == 1 do
+      w_bishop_sq = Helper.lsb(board.white_bishops)
+      b_bishop_sq = Helper.lsb(board.black_bishops)
+
+      wc = square_color(w_bishop_sq)
+      bc = square_color(b_bishop_sq)
+
+      wc == bc
+    else
+      false
     end
   end
 
