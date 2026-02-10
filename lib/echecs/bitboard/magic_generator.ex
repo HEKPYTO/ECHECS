@@ -6,6 +6,14 @@ defmodule Echecs.Bitboard.MagicGenerator do
   alias Echecs.Bitboard.Helper
 
   @doc """
+  Pre-computes magic bitboards and saves them to cache.
+  Called from Mix task or startup.
+  """
+  def init do
+    Echecs.Bitboard.Magic.init()
+  end
+
+  @doc """
   Finds magic numbers for all squares for rooks and bishops.
   Returns a structure suitable for saving.
   """
