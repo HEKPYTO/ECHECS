@@ -45,7 +45,8 @@ defmodule Echecs.Board do
             bk: 1,
             white_occ: 1,
             black_occ: 1,
-            all_occ: 1}
+            all_occ: 1,
+            at_tuple: 2}
 
   def wp(board), do: elem(board, 0)
   def wn(board), do: elem(board, 1)
@@ -62,6 +63,47 @@ defmodule Echecs.Board do
   def white_occ(board), do: elem(board, 12)
   def black_occ(board), do: elem(board, 13)
   def all_occ(board), do: elem(board, 14)
+
+  @doc """
+  Fast piece lookup on a tuple board. Returns {color, type} or nil.
+  """
+  def at_tuple(board, index) do
+    mask = 1 <<< index
+
+    if (elem(board, 14) &&& mask) == 0 do
+      nil
+    else
+      if (elem(board, 12) &&& mask) != 0 do
+        find_white_piece_tuple(board, mask)
+      else
+        find_black_piece_tuple(board, mask)
+      end
+    end
+  end
+
+  defp find_white_piece_tuple(board, mask) do
+    cond do
+      (elem(board, 0) &&& mask) != 0 -> {:white, :pawn}
+      (elem(board, 1) &&& mask) != 0 -> {:white, :knight}
+      (elem(board, 2) &&& mask) != 0 -> {:white, :bishop}
+      (elem(board, 3) &&& mask) != 0 -> {:white, :rook}
+      (elem(board, 4) &&& mask) != 0 -> {:white, :queen}
+      (elem(board, 5) &&& mask) != 0 -> {:white, :king}
+      true -> nil
+    end
+  end
+
+  defp find_black_piece_tuple(board, mask) do
+    cond do
+      (elem(board, 6) &&& mask) != 0 -> {:black, :pawn}
+      (elem(board, 7) &&& mask) != 0 -> {:black, :knight}
+      (elem(board, 8) &&& mask) != 0 -> {:black, :bishop}
+      (elem(board, 9) &&& mask) != 0 -> {:black, :rook}
+      (elem(board, 10) &&& mask) != 0 -> {:black, :queen}
+      (elem(board, 11) &&& mask) != 0 -> {:black, :king}
+      true -> nil
+    end
+  end
 
   def new_tuple do
     # Initial board state as a tuple
@@ -153,15 +195,18 @@ defmodule Echecs.Board do
 
   @doc """
   Returns true if the square `sq` is attacked by `attacker_color`.
+  Accepts both tuple and struct boards.
   """
-  def attacked?(board, sq, attacker_color) do
-    if is_tuple(board) do
-      attacked_tuple?(board, sq, attacker_color)
-    else
-      non_sliding_attacked?(board, sq, attacker_color) or
-        sliding_attacked?(board, sq, attacker_color)
-    end
+  def attacked?(board, sq, attacker_color) when is_tuple(board) do
+    non_sliding_attacked?(board, sq, attacker_color) or
+      sliding_attacked?(board, sq, attacker_color)
   end
+
+  def attacked?(board, sq, attacker_color) do
+    attacked?(from_struct(board), sq, attacker_color)
+  end
+
+  require Echecs.Move
 
   defp non_sliding_attacked?(board, sq, attacker_color) do
     pawn_attacked?(board, sq, attacker_color) or
@@ -172,79 +217,23 @@ defmodule Echecs.Board do
   defp pawn_attacked?(board, sq, attacker_color) do
     defender_color = if attacker_color == :white, do: :black, else: :white
     pawn_mask = Precomputed.get_pawn_attacks(sq, defender_color)
-    pawns = if attacker_color == :white, do: board.white_pawns, else: board.black_pawns
+    pawns = if attacker_color == :white, do: wp(board), else: bp(board)
     (pawn_mask &&& pawns) != 0
   end
 
   defp knight_attacked?(board, sq, attacker_color) do
     knight_mask = Precomputed.get_knight_attacks(sq)
-    knights = if attacker_color == :white, do: board.white_knights, else: board.black_knights
+    knights = if attacker_color == :white, do: wn(board), else: bn(board)
     (knight_mask &&& knights) != 0
   end
 
   defp king_attacked?(board, sq, attacker_color) do
     king_mask = Precomputed.get_king_attacks(sq)
-    kings = if attacker_color == :white, do: board.white_king, else: board.black_king
-    (king_mask &&& kings) != 0
-  end
-
-  defp sliding_attacked?(board, sq, attacker_color) do
-    bishop_mask = Magic.get_bishop_attacks(sq, board.all_pieces)
-
-    bishops_queens =
-      if attacker_color == :white,
-        do: board.white_bishops ||| board.white_queens,
-        else: board.black_bishops ||| board.black_queens
-
-    diag_hit = (bishop_mask &&& bishops_queens) != 0
-
-    if diag_hit do
-      true
-    else
-      rook_mask = Magic.get_rook_attacks(sq, board.all_pieces)
-
-      rooks_queens =
-        if attacker_color == :white,
-          do: board.white_rooks ||| board.white_queens,
-          else: board.black_rooks ||| board.black_queens
-
-      (rook_mask &&& rooks_queens) != 0
-    end
-  end
-
-  require Echecs.Move
-
-  def attacked_tuple?(board, sq, attacker_color) do
-    non_sliding_attacked_tuple?(board, sq, attacker_color) or
-      sliding_attacked_tuple?(board, sq, attacker_color)
-  end
-
-  defp non_sliding_attacked_tuple?(board, sq, attacker_color) do
-    pawn_attacked_tuple?(board, sq, attacker_color) or
-      knight_attacked_tuple?(board, sq, attacker_color) or
-      king_attacked_tuple?(board, sq, attacker_color)
-  end
-
-  defp pawn_attacked_tuple?(board, sq, attacker_color) do
-    defender_color = if attacker_color == :white, do: :black, else: :white
-    pawn_mask = Precomputed.get_pawn_attacks(sq, defender_color)
-    pawns = if attacker_color == :white, do: wp(board), else: bp(board)
-    (pawn_mask &&& pawns) != 0
-  end
-
-  defp knight_attacked_tuple?(board, sq, attacker_color) do
-    knight_mask = Precomputed.get_knight_attacks(sq)
-    knights = if attacker_color == :white, do: wn(board), else: bn(board)
-    (knight_mask &&& knights) != 0
-  end
-
-  defp king_attacked_tuple?(board, sq, attacker_color) do
-    king_mask = Precomputed.get_king_attacks(sq)
     kings = if attacker_color == :white, do: wk(board), else: bk(board)
     (king_mask &&& kings) != 0
   end
 
-  defp sliding_attacked_tuple?(board, sq, attacker_color) do
+  defp sliding_attacked?(board, sq, attacker_color) do
     bishop_mask = Magic.get_bishop_attacks(sq, all_occ(board))
 
     bishops_queens =
@@ -489,7 +478,11 @@ defmodule Echecs.Board do
     |> update_aggregates()
   end
 
-  @spec at(t(), square()) :: piece()
+  @spec at(t() | board_tuple(), square()) :: piece()
+  def at(board, index) when is_tuple(board) and index in 0..63 do
+    at_tuple(board, index)
+  end
+
   def at(board, index) when index in 0..63 do
     mask = 1 <<< index
 

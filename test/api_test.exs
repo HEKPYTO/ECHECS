@@ -1,4 +1,4 @@
-defmodule EchecsTest do
+defmodule Echecs.ApiTest do
   use ExUnit.Case
   alias Echecs.{Board, Game, MoveGen}
 

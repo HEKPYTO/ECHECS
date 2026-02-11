@@ -6,6 +6,7 @@ defmodule Echecs.Zobrist do
   import Bitwise
 
   @key :zobrist_keys
+  @castling_hashes_key :zobrist_castling_hashes
 
   def init do
     :rand.seed(:exsss, {1, 2, 3})
@@ -27,20 +28,34 @@ defmodule Echecs.Zobrist do
     tuple_keys = List.to_tuple(all_keys)
 
     :persistent_term.put(@key, tuple_keys)
+
+    # Precompute combined castling hashes for all 16 states
+    castling_hashes =
+      for state <- 0..15 do
+        compute_castling_hash(state, castling_keys)
+      end
+      |> List.to_tuple()
+
+    :persistent_term.put(@castling_hashes_key, castling_hashes)
+
     :ok
+  end
+
+  defp compute_castling_hash(state, castling_keys) do
+    Enum.reduce(0..3, 0, fn bit, acc ->
+      if (state &&& 1 <<< bit) != 0 do
+        bxor(acc, Enum.at(castling_keys, bit))
+      else
+        acc
+      end
+    end)
   end
 
   defp rand64 do
     :rand.uniform(0xFFFFFFFFFFFFFFFF)
   end
 
-  @compile {:inline,
-            piece_index: 3,
-            castling_index: 2,
-            ep_index: 1,
-            side_index: 0,
-            color_to_int: 1,
-            type_to_int: 1}
+  @compile {:inline, piece_index: 3, ep_index: 1, side_index: 0, color_to_int: 1, type_to_int: 1}
 
   defp color_to_int(:white), do: 0
   defp color_to_int(:black), do: 1
@@ -55,11 +70,6 @@ defmodule Echecs.Zobrist do
   defp piece_index(color, type, sq) do
     color_to_int(color) * 384 + type_to_int(type) * 64 + sq
   end
-
-  defp castling_index(:white, :kingside), do: 768
-  defp castling_index(:white, :queenside), do: 769
-  defp castling_index(:black, :kingside), do: 770
-  defp castling_index(:black, :queenside), do: 771
 
   defp ep_index(file), do: 772 + file
 
@@ -81,16 +91,9 @@ defmodule Echecs.Zobrist do
         end
       end)
 
-    h =
-      [:white, :black]
-      |> Enum.reduce(h, fn color, acc ->
-        rights = Map.get(castling, color, [])
-
-        Enum.reduce(rights, acc, fn side, a ->
-          idx = castling_index(color, side)
-          bxor(a, elem(keys, idx))
-        end)
-      end)
+    # XOR castling hash using precomputed table
+    castling_hashes = :persistent_term.get(@castling_hashes_key)
+    h = bxor(h, elem(castling_hashes, castling))
 
     h =
       if en_passant do
@@ -123,7 +126,7 @@ defmodule Echecs.Zobrist do
     current_hash
     |> bxor(elem(keys, side_index()))
     |> update_ep(old_ep, new_ep, keys)
-    |> update_castling_rights(old_castling, new_castling, keys)
+    |> update_castling_hash(old_castling, new_castling)
     |> update_pieces(move, piece, target_piece, keys)
     |> update_special_moves(move, piece, turn, keys)
   end
@@ -133,10 +136,15 @@ defmodule Echecs.Zobrist do
     if new_ep, do: bxor(h, elem(keys, ep_index(rem(new_ep, 8)))), else: h
   end
 
-  defp update_castling_rights(h, old_castling, new_castling, keys) do
-    h
-    |> xor_castling(old_castling, keys)
-    |> xor_castling(new_castling, keys)
+  defp update_castling_hash(h, old_castling, new_castling) do
+    changed = bxor(old_castling, new_castling)
+
+    if changed != 0 do
+      castling_hashes = :persistent_term.get(@castling_hashes_key)
+      bxor(h, elem(castling_hashes, changed))
+    else
+      h
+    end
   end
 
   defp update_pieces(h, move, {c, t}, target_piece, keys) do
@@ -194,14 +202,5 @@ defmodule Echecs.Zobrist do
     h
     |> bxor(elem(keys, idx_from))
     |> bxor(elem(keys, idx_to))
-  end
-
-  defp xor_castling(h, rights_map, keys) do
-    Enum.reduce(rights_map, h, fn {color, rights}, acc ->
-      Enum.reduce(rights, acc, fn side, a ->
-        idx = castling_index(color, side)
-        bxor(a, elem(keys, idx))
-      end)
-    end)
   end
 end

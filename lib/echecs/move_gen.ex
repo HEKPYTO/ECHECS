@@ -1,21 +1,148 @@
 defmodule Echecs.MoveGen do
   @moduledoc """
-  Generates legal moves for a given game state using optimized bitboard operations.
+  Legal-only move generation using check_mask + pin_mask technique.
+  Generates only legal moves directly without pseudo-legal filtering.
   """
 
   import Bitwise
-  alias Echecs.Bitboard.{Helper, Magic, Precomputed}
+  alias Echecs.Bitboard.{Constants, Helper, Magic, Precomputed}
   alias Echecs.{Board, Game, Move, Piece}
 
   require Echecs.Move
+  require Echecs.Bitboard.Constants
+
+  # credo:disable-for-this-file Credo.Check.Refactor.Nesting
+
+  @mask64 Constants.mask64()
+
+  @compile {:inline,
+            get_occupancies: 2,
+            get_king_bb: 2,
+            get_pawns: 2,
+            get_knights: 2,
+            get_bishops: 2,
+            get_rooks: 2,
+            get_queens: 2,
+            get_slider_bb: 3,
+            get_slider_attacks: 3,
+            shift_pawn: 2,
+            ensure_tuple: 1}
+
+  # ── Public API ──
 
   @doc """
   Returns a list of all legal moves for the current player.
   """
   def legal_moves(%Game{} = game) do
-    generate_pseudo_moves_int(game)
-    |> Enum.filter(&legal_int?(game, &1))
+    legal_moves_int(game)
     |> Enum.map(&Move.to_struct/1)
+  end
+
+  @doc """
+  Returns all legal moves as packed integers (no struct allocation).
+  """
+  def legal_moves_int(%Game{} = game) do
+    board = ensure_tuple(game.board)
+    turn = game.turn
+    opponent = Piece.opponent(turn)
+
+    {us_bb, them_bb, all_bb} = get_occupancies(board, turn)
+    king_bb = get_king_bb(board, turn)
+    king_sq = Helper.lsb(king_bb)
+
+    # Compute checkers
+    checkers = compute_checkers(board, king_sq, opponent, all_bb)
+    num_checkers = Helper.pop_count(checkers)
+
+    # Compute danger squares for king (with king removed from occupancy)
+    occ_no_king = bxor(all_bb, king_bb)
+    danger = compute_danger(board, opponent, occ_no_king)
+
+    # King moves (always generated)
+    king_targets =
+      Precomputed.get_king_attacks(king_sq) &&& bnot(us_bb) &&& bnot(danger) &&& @mask64
+
+    moves = bitboard_to_moves_from(king_targets, king_sq, [])
+
+    if num_checkers >= 2 do
+      # Double check: only king can move
+      moves
+    else
+      # Compute check_mask
+      check_mask = compute_check_mask(checkers, king_sq)
+
+      # Compute pins
+      {pinned, pin_rays} = compute_pins(board, king_sq, turn, us_bb, them_bb)
+
+      # Generate non-king moves restricted by check_mask and pins
+      moves
+      |> gen_pawn_moves(
+        board,
+        turn,
+        us_bb,
+        them_bb,
+        all_bb,
+        game.en_passant,
+        check_mask,
+        pinned,
+        pin_rays,
+        king_sq
+      )
+      |> gen_knight_moves(board, turn, us_bb, check_mask, pinned)
+      |> gen_slider_moves(:bishop, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
+      |> gen_slider_moves(:rook, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
+      |> gen_slider_moves(:queen, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
+      |> gen_castling(king_sq, turn, game, all_bb, danger, num_checkers)
+    end
+  end
+
+  @doc """
+  Returns true if there is at least one legal move. Short-circuits on first found.
+  """
+  def has_legal_move?(%Game{} = game) do
+    board = ensure_tuple(game.board)
+    turn = game.turn
+    opponent = Piece.opponent(turn)
+
+    {us_bb, them_bb, all_bb} = get_occupancies(board, turn)
+    king_bb = get_king_bb(board, turn)
+    king_sq = Helper.lsb(king_bb)
+
+    checkers = compute_checkers(board, king_sq, opponent, all_bb)
+    num_checkers = Helper.pop_count(checkers)
+
+    occ_no_king = bxor(all_bb, king_bb)
+    danger = compute_danger(board, opponent, occ_no_king)
+
+    king_targets =
+      Precomputed.get_king_attacks(king_sq) &&& bnot(us_bb) &&& bnot(danger) &&& @mask64
+
+    if king_targets != 0 do
+      true
+    else
+      if num_checkers >= 2 do
+        false
+      else
+        check_mask = compute_check_mask(checkers, king_sq)
+        {pinned, pin_rays} = compute_pins(board, king_sq, turn, us_bb, them_bb)
+
+        has_non_king_move?(
+          board,
+          turn,
+          us_bb,
+          them_bb,
+          all_bb,
+          game.en_passant,
+          check_mask,
+          pinned,
+          pin_rays,
+          king_sq,
+          game,
+          danger,
+          num_checkers
+        )
+      end
+    end
   end
 
   @doc """
@@ -42,80 +169,12 @@ defmodule Echecs.MoveGen do
     |> Enum.map(&Move.to_struct/1)
   end
 
-  # Internal integer generators
-  defp generate_captures_int(%Game{board: board, turn: turn} = game) do
-    board_tuple = if is_tuple(board), do: board, else: Board.from_struct(board)
-
-    us_bb =
-      if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
-
-    them_bb =
-      if turn == :white, do: Board.black_occ(board_tuple), else: Board.white_occ(board_tuple)
-
-    # For captures, target must be 'them_bb' (plus EP)
-
-    generate_pawn_captures([], Board.wp(board_tuple), turn, them_bb, game.en_passant)
-    |> generate_pawn_captures_only(board_tuple, turn, them_bb, game.en_passant)
-    |> generate_knight_moves(board_tuple, turn, us_bb, them_bb)
-    |> generate_sliding_moves(
-      :bishop,
-      board_tuple,
-      turn,
-      us_bb,
-      Board.all_occ(board_tuple),
-      them_bb
-    )
-    |> generate_sliding_moves(
-      :rook,
-      board_tuple,
-      turn,
-      us_bb,
-      Board.all_occ(board_tuple),
-      them_bb
-    )
-    |> generate_sliding_moves(
-      :queen,
-      board_tuple,
-      turn,
-      us_bb,
-      Board.all_occ(board_tuple),
-      them_bb
-    )
-    |> generate_king_moves(board_tuple, turn, us_bb, game, them_bb)
-
-    # King captures only (no castling)
-  end
-
-  defp generate_quiets_int(%Game{board: board, turn: turn} = game) do
-    board_tuple = if is_tuple(board), do: board, else: Board.from_struct(board)
-
-    us_bb =
-      if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
-
-    all_bb = Board.all_occ(board_tuple)
-    # Target mask for quiets
-    empty_bb = bnot(all_bb)
-
-    []
-    |> generate_pawn_quiets(board_tuple, turn, all_bb)
-    |> generate_knight_moves(board_tuple, turn, us_bb, empty_bb)
-    |> generate_sliding_moves(:bishop, board_tuple, turn, us_bb, all_bb, empty_bb)
-    |> generate_sliding_moves(:rook, board_tuple, turn, us_bb, all_bb, empty_bb)
-    |> generate_sliding_moves(:queen, board_tuple, turn, us_bb, all_bb, empty_bb)
-    |> generate_king_moves(board_tuple, turn, us_bb, game, empty_bb)
-    # Add castling here? Yes, castling is a quiet move.
-    # Only works if King mask correct
-    |> generate_castling_moves(Board.wk(board_tuple), turn, game)
-  end
-
   def generate_moves_targeting(game, target_sq, piece_type) do
-    board = game.board
+    board = ensure_tuple(game.board)
     turn = game.turn
+    all_bb = Board.all_occ(board)
 
-    piece_bb =
-      if turn == :white,
-        do: Map.get(board, get_bb_key(:white, piece_type)),
-        else: Map.get(board, get_bb_key(:black, piece_type))
+    piece_bb = get_piece_bb(board, turn, piece_type)
 
     candidates_bb =
       case piece_type do
@@ -123,14 +182,14 @@ defmodule Echecs.MoveGen do
           Precomputed.get_knight_attacks(target_sq) &&& piece_bb
 
         :bishop ->
-          Magic.get_bishop_attacks(target_sq, board.all_pieces) &&& piece_bb
+          Magic.get_bishop_attacks(target_sq, all_bb) &&& piece_bb
 
         :rook ->
-          Magic.get_rook_attacks(target_sq, board.all_pieces) &&& piece_bb
+          Magic.get_rook_attacks(target_sq, all_bb) &&& piece_bb
 
         :queen ->
-          (Magic.get_bishop_attacks(target_sq, board.all_pieces) |||
-             Magic.get_rook_attacks(target_sq, board.all_pieces)) &&& piece_bb
+          (Magic.get_bishop_attacks(target_sq, all_bb) |||
+             Magic.get_rook_attacks(target_sq, all_bb)) &&& piece_bb
 
         :king ->
           Precomputed.get_king_attacks(target_sq) &&& piece_bb
@@ -147,22 +206,839 @@ defmodule Echecs.MoveGen do
     end
   end
 
-  defp bitboard_to_moves_to(0, _, acc), do: acc
+  # ── Check/Pin/Danger computation ──
 
-  defp bitboard_to_moves_to(bb, to, acc) do
+  defp compute_checkers(board, king_sq, attacker_color, all_bb) do
+    # Which enemy pieces attack the king square?
+    defender_color = Piece.opponent(attacker_color)
+
+    pawn_attackers =
+      Precomputed.get_pawn_attacks(king_sq, defender_color) &&& get_pawns(board, attacker_color)
+
+    knight_attackers =
+      Precomputed.get_knight_attacks(king_sq) &&& get_knights(board, attacker_color)
+
+    bishop_attacks = Magic.get_bishop_attacks(king_sq, all_bb)
+    rook_attacks = Magic.get_rook_attacks(king_sq, all_bb)
+    bq = get_bishops(board, attacker_color) ||| get_queens(board, attacker_color)
+    rq = get_rooks(board, attacker_color) ||| get_queens(board, attacker_color)
+
+    pawn_attackers ||| knight_attackers ||| (bishop_attacks &&& bq) ||| (rook_attacks &&& rq)
+  end
+
+  defp compute_check_mask(0, _king_sq), do: @mask64
+
+  defp compute_check_mask(checkers, king_sq) do
+    checker_sq = Helper.lsb(checkers)
+    Precomputed.get_between(king_sq, checker_sq) ||| 1 <<< checker_sq
+  end
+
+  defp compute_danger(board, attacker_color, occ_no_king) do
+    # All squares attacked by attacker_color, with our king removed from occupancy
+    danger = 0
+
+    # Pawn attacks (bulk)
+    enemy_pawns = get_pawns(board, attacker_color)
+
+    danger =
+      if attacker_color == :white do
+        # White pawns attack "upward" (lower indices) = shift >>> 7 and >>> 9
+        ne = (enemy_pawns &&& bnot(Constants.file_h()) &&& @mask64) >>> 7
+        nw = (enemy_pawns &&& bnot(Constants.file_a()) &&& @mask64) >>> 9
+        danger ||| ne ||| nw
+      else
+        # Black pawns attack "downward" (higher indices) = shift <<< 7 and <<< 9
+        se = (enemy_pawns &&& bnot(Constants.file_a()) &&& @mask64) <<< 7
+        sw = (enemy_pawns &&& bnot(Constants.file_h()) &&& @mask64) <<< 9
+        danger ||| se ||| sw
+      end
+
+    # Knight attacks
+    danger =
+      or_piece_attacks(
+        danger,
+        get_knights(board, attacker_color),
+        &Precomputed.get_knight_attacks/1
+      )
+
+    # Bishop + Queen diagonal attacks (using occ_no_king)
+    enemy_bq = get_bishops(board, attacker_color) ||| get_queens(board, attacker_color)
+    danger = or_slider_attacks(danger, enemy_bq, occ_no_king, &Magic.get_bishop_attacks/2)
+
+    # Rook + Queen HV attacks (using occ_no_king)
+    enemy_rq = get_rooks(board, attacker_color) ||| get_queens(board, attacker_color)
+    danger = or_slider_attacks(danger, enemy_rq, occ_no_king, &Magic.get_rook_attacks/2)
+
+    # Enemy king attacks
+    enemy_king_sq = Helper.lsb(get_king_bb(board, attacker_color))
+    if enemy_king_sq, do: danger ||| Precomputed.get_king_attacks(enemy_king_sq), else: danger
+  end
+
+  defp or_piece_attacks(danger, 0, _fun), do: danger
+
+  defp or_piece_attacks(danger, bb, fun) do
+    sq = Helper.lsb(bb)
+    or_piece_attacks(danger ||| fun.(sq), bb &&& bb - 1, fun)
+  end
+
+  defp or_slider_attacks(danger, 0, _occ, _fun), do: danger
+
+  defp or_slider_attacks(danger, bb, occ, fun) do
+    sq = Helper.lsb(bb)
+    or_slider_attacks(danger ||| fun.(sq, occ), bb &&& bb - 1, occ, fun)
+  end
+
+  defp compute_pins(board, king_sq, turn, us_bb, them_bb) do
+    opponent = Piece.opponent(turn)
+
+    # Potential HV pinners: enemy R/Q that can see king through our pieces
+    enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
+    rook_xray = Magic.get_rook_attacks(king_sq, them_bb)
+    hv_pinners = rook_xray &&& enemy_rq
+
+    # Potential diagonal pinners: enemy B/Q
+    enemy_bq = get_bishops(board, opponent) ||| get_queens(board, opponent)
+    bishop_xray = Magic.get_bishop_attacks(king_sq, them_bb)
+    diag_pinners = bishop_xray &&& enemy_bq
+
+    {pinned, pin_rays} = process_pinners(hv_pinners, king_sq, us_bb, 0, %{})
+    process_pinners(diag_pinners, king_sq, us_bb, pinned, pin_rays)
+  end
+
+  defp process_pinners(0, _king_sq, _us_bb, pinned, pin_rays), do: {pinned, pin_rays}
+
+  defp process_pinners(pinners, king_sq, us_bb, pinned, pin_rays) do
+    pinner_sq = Helper.lsb(pinners)
+    between = Precomputed.get_between(king_sq, pinner_sq)
+    our_between = between &&& us_bb
+
+    {pinned, pin_rays} =
+      if Helper.pop_count(our_between) == 1 do
+        pinned_sq = Helper.lsb(our_between)
+        ray = between ||| 1 <<< pinner_sq
+        {pinned ||| our_between, Map.put(pin_rays, pinned_sq, ray)}
+      else
+        {pinned, pin_rays}
+      end
+
+    process_pinners(pinners &&& pinners - 1, king_sq, us_bb, pinned, pin_rays)
+  end
+
+  # ── Non-king move generation (with check_mask + pin restrictions) ──
+
+  # Knights: pinned knights can NEVER move
+  defp gen_knight_moves(acc, board, turn, us_bb, check_mask, pinned) do
+    knights = get_knights(board, turn) &&& bnot(pinned) &&& @mask64
+    do_gen_knights(knights, acc, us_bb, check_mask)
+  end
+
+  defp do_gen_knights(0, acc, _us_bb, _check_mask), do: acc
+
+  defp do_gen_knights(knights, acc, us_bb, check_mask) do
+    from = Helper.lsb(knights)
+    targets = Precomputed.get_knight_attacks(from) &&& bnot(us_bb) &&& check_mask &&& @mask64
+    acc = bitboard_to_moves_from(targets, from, acc)
+    do_gen_knights(knights &&& knights - 1, acc, us_bb, check_mask)
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp gen_slider_moves(acc, type, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) do
+    bb = get_slider_bb(board, turn, type)
+    do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+  end
+
+  defp do_gen_sliders(0, acc, _type, _us_bb, _all_bb, _check_mask, _pinned, _pin_rays), do: acc
+
+  defp do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pinned, pin_rays) do
     from = Helper.lsb(bb)
-    bitboard_to_moves_to(bb &&& bb - 1, to, [Move.pack(from, to, nil, nil) | acc])
+    attacks = get_slider_attacks(type, from, all_bb)
+    targets = attacks &&& bnot(us_bb) &&& check_mask &&& @mask64
+
+    targets =
+      if (pinned &&& 1 <<< from) != 0 do
+        targets &&& Map.get(pin_rays, from, 0)
+      else
+        targets
+      end
+
+    acc = bitboard_to_moves_from(targets, from, acc)
+    do_gen_sliders(bb &&& bb - 1, acc, type, us_bb, all_bb, check_mask, pinned, pin_rays)
   end
 
-  defp bitboard_to_moves_from(0, _, acc), do: acc
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp gen_pawn_moves(
+         acc,
+         board,
+         turn,
+         us_bb,
+         them_bb,
+         all_bb,
+         ep_sq,
+         check_mask,
+         pinned,
+         pin_rays,
+         king_sq
+       ) do
+    pawns = get_pawns(board, turn)
+    {push_dir, promo_rank, double_rank_mask, ep_cap_offset} = pawn_params(turn)
 
-  defp bitboard_to_moves_from(bb, from, acc) do
+    # ── Single pushes ──
+    single_pushes = shift_pawn(pawns, push_dir) &&& bnot(all_bb) &&& @mask64
+
+    acc =
+      extract_legal_pawn_pushes(
+        single_pushes,
+        -push_dir,
+        turn,
+        promo_rank,
+        check_mask,
+        pinned,
+        pin_rays,
+        acc
+      )
+
+    # ── Double pushes ──
+    double_pushes =
+      shift_pawn(single_pushes &&& double_rank_mask, push_dir) &&& bnot(all_bb) &&& @mask64
+
+    acc =
+      extract_legal_pawn_double_pushes(
+        double_pushes,
+        -push_dir * 2,
+        check_mask,
+        pinned,
+        pin_rays,
+        acc
+      )
+
+    # ── Captures ──
+    acc = gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pinned, pin_rays, acc)
+
+    # ── En passant ──
+    if ep_sq do
+      gen_en_passant(
+        pawns,
+        turn,
+        ep_sq,
+        ep_cap_offset,
+        king_sq,
+        board,
+        us_bb,
+        them_bb,
+        all_bb,
+        check_mask,
+        pinned,
+        pin_rays,
+        acc
+      )
+    else
+      acc
+    end
+  end
+
+  defp pawn_params(:white) do
+    # push_dir: negative = towards lower indices = "north"
+    {-8, 0, 0x0000FF0000000000, 8}
+  end
+
+  defp pawn_params(:black) do
+    {8, 7, 0x0000000000FF0000, -8}
+  end
+
+  defp shift_pawn(bb, -8), do: bb >>> 8
+  defp shift_pawn(bb, 8), do: bb <<< 8
+
+  defp extract_legal_pawn_pushes(0, _offset, _turn, _promo_rank, _cm, _pinned, _pr, acc), do: acc
+
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+  defp extract_legal_pawn_pushes(
+         pushes,
+         offset,
+         turn,
+         promo_rank,
+         check_mask,
+         pinned,
+         pin_rays,
+         acc
+       ) do
+    to = Helper.lsb(pushes)
+    from = to + offset
+    to_bit = 1 <<< to
+
+    acc =
+      if (to_bit &&& check_mask) != 0 do
+        if (pinned &&& 1 <<< from) != 0 do
+          ray = Map.get(pin_rays, from, 0)
+
+          if (to_bit &&& ray) != 0 do
+            add_pawn_move(acc, from, to, turn, promo_rank)
+          else
+            acc
+          end
+        else
+          add_pawn_move(acc, from, to, turn, promo_rank)
+        end
+      else
+        acc
+      end
+
+    extract_legal_pawn_pushes(
+      pushes &&& pushes - 1,
+      offset,
+      turn,
+      promo_rank,
+      check_mask,
+      pinned,
+      pin_rays,
+      acc
+    )
+  end
+
+  defp extract_legal_pawn_double_pushes(0, _offset, _cm, _pinned, _pr, acc), do: acc
+
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+  defp extract_legal_pawn_double_pushes(pushes, offset, check_mask, pinned, pin_rays, acc) do
+    to = Helper.lsb(pushes)
+    from = to + offset
+    to_bit = 1 <<< to
+
+    acc =
+      if (to_bit &&& check_mask) != 0 do
+        if (pinned &&& 1 <<< from) != 0 do
+          ray = Map.get(pin_rays, from, 0)
+
+          if (to_bit &&& ray) != 0 do
+            [Move.pack(from, to, nil, nil) | acc]
+          else
+            acc
+          end
+        else
+          [Move.pack(from, to, nil, nil) | acc]
+        end
+      else
+        acc
+      end
+
+    extract_legal_pawn_double_pushes(
+      pushes &&& pushes - 1,
+      offset,
+      check_mask,
+      pinned,
+      pin_rays,
+      acc
+    )
+  end
+
+  defp gen_pawn_captures(0, _turn, _them_bb, _promo_rank, _cm, _pinned, _pr, acc), do: acc
+
+  defp gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pinned, pin_rays, acc) do
+    from = Helper.lsb(pawns)
+    attacks = Precomputed.get_pawn_attacks(from, turn)
+    captures = attacks &&& them_bb
+
+    acc = do_pawn_captures(captures, from, turn, promo_rank, check_mask, pinned, pin_rays, acc)
+
+    gen_pawn_captures(
+      pawns &&& pawns - 1,
+      turn,
+      them_bb,
+      promo_rank,
+      check_mask,
+      pinned,
+      pin_rays,
+      acc
+    )
+  end
+
+  defp do_pawn_captures(0, _from, _turn, _promo_rank, _cm, _pinned, _pr, acc), do: acc
+
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+  defp do_pawn_captures(captures, from, turn, promo_rank, check_mask, pinned, pin_rays, acc) do
+    to = Helper.lsb(captures)
+    to_bit = 1 <<< to
+
+    acc =
+      if (to_bit &&& check_mask) != 0 do
+        if (pinned &&& 1 <<< from) != 0 do
+          ray = Map.get(pin_rays, from, 0)
+
+          if (to_bit &&& ray) != 0 do
+            add_pawn_move(acc, from, to, turn, promo_rank)
+          else
+            acc
+          end
+        else
+          add_pawn_move(acc, from, to, turn, promo_rank)
+        end
+      else
+        acc
+      end
+
+    do_pawn_captures(
+      captures &&& captures - 1,
+      from,
+      turn,
+      promo_rank,
+      check_mask,
+      pinned,
+      pin_rays,
+      acc
+    )
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp gen_en_passant(
+         pawns,
+         turn,
+         ep_sq,
+         ep_cap_offset,
+         king_sq,
+         board,
+         us_bb,
+         them_bb,
+         all_bb,
+         check_mask,
+         pinned,
+         pin_rays,
+         acc
+       ) do
+    # Find our pawns that can capture en passant
+    ep_attackers = Precomputed.get_pawn_attacks(ep_sq, Piece.opponent(turn)) &&& pawns
+
+    do_gen_ep(
+      ep_attackers,
+      ep_sq,
+      ep_cap_offset,
+      king_sq,
+      turn,
+      board,
+      us_bb,
+      them_bb,
+      all_bb,
+      check_mask,
+      pinned,
+      pin_rays,
+      acc
+    )
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp do_gen_ep(
+         0,
+         _ep_sq,
+         _offset,
+         _king_sq,
+         _turn,
+         _board,
+         _us,
+         _them,
+         _all,
+         _cm,
+         _p,
+         _pr,
+         acc
+       ),
+       do: acc
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp do_gen_ep(
+         attackers,
+         ep_sq,
+         ep_cap_offset,
+         king_sq,
+         turn,
+         board,
+         us_bb,
+         them_bb,
+         all_bb,
+         check_mask,
+         pinned,
+         pin_rays,
+         acc
+       ) do
+    from = Helper.lsb(attackers)
+    cap_sq = ep_sq + ep_cap_offset
+
+    # The captured pawn must be on check_mask OR the ep_sq itself must be on check_mask
+    # (the captured pawn is the checker in some positions)
+    ep_valid =
+      (1 <<< ep_sq &&& check_mask) != 0 or
+        (1 <<< cap_sq &&& check_mask) != 0
+
+    acc =
+      if ep_valid do
+        # Check pin restriction
+        pin_ok =
+          if (pinned &&& 1 <<< from) != 0 do
+            ray = Map.get(pin_rays, from, 0)
+            (1 <<< ep_sq &&& ray) != 0
+          else
+            true
+          end
+
+        if pin_ok do
+          # Check for horizontal discovered check (the rare EP edge case)
+          # Remove both pawns from occupancy, add capturing pawn to ep_sq
+          occ_after = bxor(all_bb, 1 <<< from ||| 1 <<< cap_sq) ||| 1 <<< ep_sq
+          opponent = Piece.opponent(turn)
+          enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
+          rook_attacks = Magic.get_rook_attacks(king_sq, occ_after)
+
+          if (rook_attacks &&& enemy_rq) == 0 do
+            [Move.pack(from, ep_sq, nil, :en_passant) | acc]
+          else
+            acc
+          end
+        else
+          acc
+        end
+      else
+        acc
+      end
+
+    do_gen_ep(
+      attackers &&& attackers - 1,
+      ep_sq,
+      ep_cap_offset,
+      king_sq,
+      turn,
+      board,
+      us_bb,
+      them_bb,
+      all_bb,
+      check_mask,
+      pinned,
+      pin_rays,
+      acc
+    )
+  end
+
+  defp add_pawn_move(acc, from, to, _turn, promo_rank) do
+    rank = div(to, 8)
+
+    if rank == promo_rank do
+      add_promotions(acc, from, to)
+    else
+      [Move.pack(from, to, nil, nil) | acc]
+    end
+  end
+
+  defp add_promotions(acc, from, to) do
+    [
+      Move.pack(from, to, :queen, nil),
+      Move.pack(from, to, :rook, nil),
+      Move.pack(from, to, :bishop, nil),
+      Move.pack(from, to, :knight, nil) | acc
+    ]
+  end
+
+  # ── Castling ──
+
+  defp gen_castling(acc, _king_sq, _turn, _game, _all_bb, _danger, num_checkers)
+       when num_checkers > 0,
+       do: acc
+
+  defp gen_castling(acc, king_sq, turn, game, all_bb, danger, 0) do
+    castling = game.castling
+
+    acc
+    |> try_castle(:kingside, castling, king_sq, turn, all_bb, danger)
+    |> try_castle(:queenside, castling, king_sq, turn, all_bb, danger)
+  end
+
+  defp try_castle(acc, side, castling, king_sq, turn, all_bb, danger) do
+    if Game.has_right?(castling, turn, side) do
+      {path_mask, check_sqs, target, special} = castle_params(side, turn)
+
+      # Path must be clear (bitwise check)
+      path_clear = (all_bb &&& path_mask) == 0
+
+      # King traversal squares must not be attacked
+      path_safe = Enum.all?(check_sqs, fn sq -> (danger &&& 1 <<< sq) == 0 end)
+
+      if path_clear and path_safe do
+        [Move.pack(king_sq, target, nil, special) | acc]
+      else
+        acc
+      end
+    else
+      acc
+    end
+  end
+
+  defp castle_params(:kingside, :white),
+    do: {Constants.white_ks_path(), [61, 62], 62, :kingside_castle}
+
+  defp castle_params(:queenside, :white),
+    do: {Constants.white_qs_path(), [59, 58], 58, :queenside_castle}
+
+  defp castle_params(:kingside, :black),
+    do: {Constants.black_ks_path(), [5, 6], 6, :kingside_castle}
+
+  defp castle_params(:queenside, :black),
+    do: {Constants.black_qs_path(), [3, 2], 2, :queenside_castle}
+
+  # ── has_legal_move? short-circuit helpers ──
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp has_non_king_move?(
+         board,
+         turn,
+         us_bb,
+         them_bb,
+         all_bb,
+         ep_sq,
+         check_mask,
+         pinned,
+         pin_rays,
+         king_sq,
+         game,
+         danger,
+         num_checkers
+       ) do
+    knights = get_knights(board, turn) &&& bnot(pinned) &&& @mask64
+
+    cond do
+      any_knight_move?(knights, us_bb, check_mask) ->
+        true
+
+      any_slider_move?(:bishop, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) ->
+        true
+
+      any_slider_move?(:rook, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) ->
+        true
+
+      any_slider_move?(:queen, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) ->
+        true
+
+      any_pawn_move?(
+        board,
+        turn,
+        us_bb,
+        them_bb,
+        all_bb,
+        ep_sq,
+        check_mask,
+        pinned,
+        pin_rays,
+        king_sq
+      ) ->
+        true
+
+      num_checkers == 0 ->
+        any_castle_int?(game.castling, Helper.lsb(get_king_bb(board, turn)), turn, all_bb, danger)
+
+      true ->
+        false
+    end
+  end
+
+  defp any_knight_move?(0, _us_bb, _check_mask), do: false
+
+  defp any_knight_move?(knights, us_bb, check_mask) do
+    from = Helper.lsb(knights)
+    targets = Precomputed.get_knight_attacks(from) &&& bnot(us_bb) &&& check_mask &&& @mask64
+    if targets != 0, do: true, else: any_knight_move?(knights &&& knights - 1, us_bb, check_mask)
+  end
+
+  defp any_slider_move?(type, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) do
+    bb = get_slider_bb(board, turn, type)
+    any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+  end
+
+  defp any_slider_move_loop?(0, _type, _us_bb, _all_bb, _cm, _pinned, _pr), do: false
+
+  defp any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pinned, pin_rays) do
+    from = Helper.lsb(bb)
+    attacks = get_slider_attacks(type, from, all_bb)
+    targets = attacks &&& bnot(us_bb) &&& check_mask &&& @mask64
+
+    targets =
+      if (pinned &&& 1 <<< from) != 0 do
+        targets &&& Map.get(pin_rays, from, 0)
+      else
+        targets
+      end
+
+    if targets != 0,
+      do: true,
+      else:
+        any_slider_move_loop?(bb &&& bb - 1, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp any_pawn_move?(
+         board,
+         turn,
+         _us_bb,
+         them_bb,
+         all_bb,
+         ep_sq,
+         check_mask,
+         pinned,
+         pin_rays,
+         king_sq
+       ) do
+    pawns = get_pawns(board, turn)
+    {push_dir, _promo_rank, double_rank_mask, ep_cap_offset} = pawn_params(turn)
+
+    single_pushes = shift_pawn(pawns, push_dir) &&& bnot(all_bb) &&& @mask64
+
+    double_pushes =
+      shift_pawn(single_pushes &&& double_rank_mask, push_dir) &&& bnot(all_bb) &&& @mask64
+
+    cond do
+      any_in_mask?(single_pushes, check_mask, pinned, pin_rays, -push_dir) ->
+        true
+
+      any_in_mask?(double_pushes, check_mask, pinned, pin_rays, -push_dir * 2) ->
+        true
+
+      any_pawn_capture?(pawns, turn, them_bb, check_mask, pinned, pin_rays) ->
+        true
+
+      ep_sq != nil ->
+        ep_attackers = Precomputed.get_pawn_attacks(ep_sq, Piece.opponent(turn)) &&& pawns
+
+        ep_attackers != 0 and
+          ep_is_legal_any?(
+            ep_attackers,
+            ep_sq,
+            ep_cap_offset,
+            king_sq,
+            turn,
+            board,
+            all_bb,
+            pinned,
+            pin_rays,
+            check_mask
+          )
+
+      true ->
+        false
+    end
+  end
+
+  defp any_in_mask?(0, _cm, _pinned, _pr, _offset), do: false
+
+  defp any_in_mask?(bb, check_mask, pinned, pin_rays, offset) do
     to = Helper.lsb(bb)
-    bitboard_to_moves_from(bb &&& bb - 1, from, [Move.pack(from, to, nil, nil) | acc])
+    from = to + offset
+    to_bit = 1 <<< to
+
+    ok =
+      (to_bit &&& check_mask) != 0 and
+        ((pinned &&& 1 <<< from) == 0 or (to_bit &&& Map.get(pin_rays, from, 0)) != 0)
+
+    if ok, do: true, else: any_in_mask?(bb &&& bb - 1, check_mask, pinned, pin_rays, offset)
   end
+
+  defp any_pawn_capture?(0, _turn, _them, _cm, _pinned, _pr), do: false
+
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+  defp any_pawn_capture?(pawns, turn, them_bb, check_mask, pinned, pin_rays) do
+    from = Helper.lsb(pawns)
+    attacks = Precomputed.get_pawn_attacks(from, turn)
+    captures = attacks &&& them_bb &&& check_mask
+
+    if captures != 0 do
+      if (pinned &&& 1 <<< from) != 0 do
+        ray = Map.get(pin_rays, from, 0)
+
+        if (captures &&& ray) != 0,
+          do: true,
+          else:
+            any_pawn_capture?(pawns &&& pawns - 1, turn, them_bb, check_mask, pinned, pin_rays)
+      else
+        true
+      end
+    else
+      any_pawn_capture?(pawns &&& pawns - 1, turn, them_bb, check_mask, pinned, pin_rays)
+    end
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp ep_is_legal_any?(0, _ep_sq, _offset, _king_sq, _turn, _board, _all, _pinned, _pr, _cm),
+    do: false
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp ep_is_legal_any?(
+         attackers,
+         ep_sq,
+         ep_cap_offset,
+         king_sq,
+         turn,
+         board,
+         all_bb,
+         pinned,
+         pin_rays,
+         check_mask
+       ) do
+    from = Helper.lsb(attackers)
+    cap_sq = ep_sq + ep_cap_offset
+
+    ep_valid = (1 <<< ep_sq &&& check_mask) != 0 or (1 <<< cap_sq &&& check_mask) != 0
+
+    ok =
+      if ep_valid do
+        pin_ok =
+          if (pinned &&& 1 <<< from) != 0 do
+            ray = Map.get(pin_rays, from, 0)
+            (1 <<< ep_sq &&& ray) != 0
+          else
+            true
+          end
+
+        if pin_ok do
+          occ_after = bxor(all_bb, 1 <<< from ||| 1 <<< cap_sq) ||| 1 <<< ep_sq
+          opponent = Piece.opponent(turn)
+          enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
+          rook_attacks = Magic.get_rook_attacks(king_sq, occ_after)
+          (rook_attacks &&& enemy_rq) == 0
+        else
+          false
+        end
+      else
+        false
+      end
+
+    if ok,
+      do: true,
+      else:
+        ep_is_legal_any?(
+          attackers &&& attackers - 1,
+          ep_sq,
+          ep_cap_offset,
+          king_sq,
+          turn,
+          board,
+          all_bb,
+          pinned,
+          pin_rays,
+          check_mask
+        )
+  end
+
+  defp any_castle_int?(castling, king_sq, turn, all_bb, danger) do
+    any_castle_side?(:kingside, castling, king_sq, turn, all_bb, danger) or
+      any_castle_side?(:queenside, castling, king_sq, turn, all_bb, danger)
+  end
+
+  defp any_castle_side?(side, castling, _king_sq, turn, all_bb, danger) do
+    if Game.has_right?(castling, turn, side) do
+      {path_mask, check_sqs, _target, _special} = castle_params(side, turn)
+      path_clear = (all_bb &&& path_mask) == 0
+      path_safe = Enum.all?(check_sqs, fn sq -> (danger &&& 1 <<< sq) == 0 end)
+      path_clear and path_safe
+    else
+      false
+    end
+  end
+
+  # ── Pseudo-legal generation (kept for API compatibility) ──
 
   defp generate_pseudo_moves_int(%Game{board: board, turn: turn} = game) do
-    board_tuple = if is_tuple(board), do: board, else: Board.from_struct(board)
+    board_tuple = ensure_tuple(board)
 
     us_bb =
       if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
@@ -171,21 +1047,75 @@ defmodule Echecs.MoveGen do
       if turn == :white, do: Board.black_occ(board_tuple), else: Board.white_occ(board_tuple)
 
     all_bb = Board.all_occ(board_tuple)
-    target_mask = bnot(us_bb)
+    target_mask = bnot(us_bb) &&& @mask64
 
     []
     |> generate_pawn_moves(board_tuple, turn, them_bb, all_bb, game.en_passant)
-    |> generate_knight_moves(board_tuple, turn, us_bb, target_mask)
-    |> generate_sliding_moves(:bishop, board_tuple, turn, us_bb, all_bb, target_mask)
-    |> generate_sliding_moves(:rook, board_tuple, turn, us_bb, all_bb, target_mask)
-    |> generate_sliding_moves(:queen, board_tuple, turn, us_bb, all_bb, target_mask)
-    |> generate_king_moves(board_tuple, turn, us_bb, game, target_mask)
-    |> generate_castling_moves(
-      if(turn == :white, do: Board.wk(board_tuple), else: Board.bk(board_tuple)),
+    |> generate_knight_moves_pseudo(board_tuple, turn, target_mask)
+    |> generate_sliding_moves_pseudo(:bishop, board_tuple, turn, all_bb, target_mask)
+    |> generate_sliding_moves_pseudo(:rook, board_tuple, turn, all_bb, target_mask)
+    |> generate_sliding_moves_pseudo(:queen, board_tuple, turn, all_bb, target_mask)
+    |> generate_king_moves_pseudo(board_tuple, turn, target_mask)
+    |> generate_castling_moves_pseudo(
+      get_king_bb(board_tuple, turn),
       turn,
       game
     )
   end
+
+  defp generate_captures_int(%Game{board: board, turn: turn} = game) do
+    board_tuple = ensure_tuple(board)
+
+    _us_bb =
+      if turn == :white, do: Board.white_occ(board_tuple), else: Board.black_occ(board_tuple)
+
+    them_bb =
+      if turn == :white, do: Board.black_occ(board_tuple), else: Board.white_occ(board_tuple)
+
+    generate_pawn_captures([], Board.wp(board_tuple), turn, them_bb, game.en_passant)
+    |> generate_pawn_captures_only(board_tuple, turn, them_bb, game.en_passant)
+    |> generate_knight_moves_pseudo(board_tuple, turn, them_bb)
+    |> generate_sliding_moves_pseudo(
+      :bishop,
+      board_tuple,
+      turn,
+      Board.all_occ(board_tuple),
+      them_bb
+    )
+    |> generate_sliding_moves_pseudo(
+      :rook,
+      board_tuple,
+      turn,
+      Board.all_occ(board_tuple),
+      them_bb
+    )
+    |> generate_sliding_moves_pseudo(
+      :queen,
+      board_tuple,
+      turn,
+      Board.all_occ(board_tuple),
+      them_bb
+    )
+    |> generate_king_moves_pseudo(board_tuple, turn, them_bb)
+  end
+
+  defp generate_quiets_int(%Game{board: board, turn: turn} = game) do
+    board_tuple = ensure_tuple(board)
+
+    all_bb = Board.all_occ(board_tuple)
+    empty_bb = bnot(all_bb) &&& @mask64
+
+    []
+    |> generate_pawn_quiets(board_tuple, turn, all_bb)
+    |> generate_knight_moves_pseudo(board_tuple, turn, empty_bb)
+    |> generate_sliding_moves_pseudo(:bishop, board_tuple, turn, all_bb, empty_bb)
+    |> generate_sliding_moves_pseudo(:rook, board_tuple, turn, all_bb, empty_bb)
+    |> generate_sliding_moves_pseudo(:queen, board_tuple, turn, all_bb, empty_bb)
+    |> generate_king_moves_pseudo(board_tuple, turn, empty_bb)
+    |> generate_castling_moves_pseudo(get_king_bb(board_tuple, turn), turn, game)
+  end
+
+  # ── Pseudo-legal internal generators ──
 
   defp generate_pawn_captures_only(acc, board, :white, them_bb, ep_sq) do
     generate_pawn_captures(acc, Board.wp(board), :white, them_bb, ep_sq)
@@ -197,31 +1127,31 @@ defmodule Echecs.MoveGen do
 
   defp generate_pawn_quiets(acc, board, :white, all_bb) do
     pawns = Board.wp(board)
-    single_pushes = pawns >>> 8 &&& bnot(all_bb)
+    single_pushes = pawns >>> 8 &&& bnot(all_bb) &&& @mask64
     acc = extract_pawn_moves(single_pushes, 8, :white, acc)
 
     rank_3_mask = 0x0000FF0000000000
-    double_pushes = (single_pushes &&& rank_3_mask) >>> 8 &&& bnot(all_bb)
+    double_pushes = (single_pushes &&& rank_3_mask) >>> 8 &&& bnot(all_bb) &&& @mask64
     extract_pawn_double_moves(double_pushes, 16, acc)
   end
 
   defp generate_pawn_quiets(acc, board, :black, all_bb) do
     pawns = Board.bp(board)
-    single_pushes = pawns <<< 8 &&& bnot(all_bb)
+    single_pushes = pawns <<< 8 &&& bnot(all_bb) &&& @mask64
     acc = extract_pawn_moves(single_pushes, -8, :black, acc)
 
     rank_6_mask = 0x0000000000FF0000
-    double_pushes = (single_pushes &&& rank_6_mask) <<< 8 &&& bnot(all_bb)
+    double_pushes = (single_pushes &&& rank_6_mask) <<< 8 &&& bnot(all_bb) &&& @mask64
     extract_pawn_double_moves(double_pushes, -16, acc)
   end
 
   defp generate_pawn_moves(acc, board, :white, them_bb, all_bb, ep_sq) do
     pawns = Board.wp(board)
-    single_pushes = pawns >>> 8 &&& bnot(all_bb)
+    single_pushes = pawns >>> 8 &&& bnot(all_bb) &&& @mask64
     acc = extract_pawn_moves(single_pushes, 8, :white, acc)
 
     rank_3_mask = 0x0000FF0000000000
-    double_pushes = (single_pushes &&& rank_3_mask) >>> 8 &&& bnot(all_bb)
+    double_pushes = (single_pushes &&& rank_3_mask) >>> 8 &&& bnot(all_bb) &&& @mask64
     acc = extract_pawn_double_moves(double_pushes, 16, acc)
 
     generate_pawn_captures(acc, pawns, :white, them_bb, ep_sq)
@@ -229,11 +1159,11 @@ defmodule Echecs.MoveGen do
 
   defp generate_pawn_moves(acc, board, :black, them_bb, all_bb, ep_sq) do
     pawns = Board.bp(board)
-    single_pushes = pawns <<< 8 &&& bnot(all_bb)
+    single_pushes = pawns <<< 8 &&& bnot(all_bb) &&& @mask64
     acc = extract_pawn_moves(single_pushes, -8, :black, acc)
 
     rank_6_mask = 0x0000000000FF0000
-    double_pushes = (single_pushes &&& rank_6_mask) <<< 8 &&& bnot(all_bb)
+    double_pushes = (single_pushes &&& rank_6_mask) <<< 8 &&& bnot(all_bb) &&& @mask64
     acc = extract_pawn_double_moves(double_pushes, -16, acc)
 
     generate_pawn_captures(acc, pawns, :black, them_bb, ep_sq)
@@ -303,14 +1233,108 @@ defmodule Echecs.MoveGen do
     end
   end
 
-  defp add_promotions(acc, from, to) do
-    [:queen, :rook, :bishop, :knight]
-    |> Enum.reduce(acc, fn p, a -> [Move.pack(from, to, p, nil) | a] end)
+  defp generate_knight_moves_pseudo(acc, board, turn, target_mask) do
+    knights = if turn == :white, do: Board.wn(board), else: Board.bn(board)
+    do_gen_knights_pseudo(knights, acc, target_mask)
   end
 
+  defp do_gen_knights_pseudo(0, acc, _), do: acc
+
+  defp do_gen_knights_pseudo(knights, acc, target_mask) do
+    from = Helper.lsb(knights)
+    valid_moves = Precomputed.get_knight_attacks(from) &&& target_mask
+    acc = bitboard_to_moves_from(valid_moves, from, acc)
+    do_gen_knights_pseudo(knights &&& knights - 1, acc, target_mask)
+  end
+
+  defp generate_sliding_moves_pseudo(acc, type, board, turn, all_bb, target_mask) do
+    bb = get_slider_bb(board, turn, type)
+    do_gen_sliders_pseudo(bb, acc, type, all_bb, target_mask)
+  end
+
+  defp do_gen_sliders_pseudo(0, acc, _, _, _), do: acc
+
+  defp do_gen_sliders_pseudo(bb, acc, type, all_bb, target_mask) do
+    from = Helper.lsb(bb)
+    attacks = get_slider_attacks(type, from, all_bb)
+    valid_moves = attacks &&& target_mask
+    acc = bitboard_to_moves_from(valid_moves, from, acc)
+    do_gen_sliders_pseudo(bb &&& bb - 1, acc, type, all_bb, target_mask)
+  end
+
+  defp generate_king_moves_pseudo(acc, board, turn, target_mask) do
+    king_bb = get_king_bb(board, turn)
+
+    if king_bb == 0 do
+      acc
+    else
+      king_sq = Helper.lsb(king_bb)
+      valid_moves = Precomputed.get_king_attacks(king_sq) &&& target_mask
+      bitboard_to_moves_from(valid_moves, king_sq, acc)
+    end
+  end
+
+  defp generate_castling_moves_pseudo(acc, king_bb, turn, game) do
+    if king_bb == 0 do
+      acc
+    else
+      king_sq = Helper.lsb(king_bb)
+      castling = game.castling
+      opponent = Piece.opponent(turn)
+
+      if Game.in_check?(game) do
+        acc
+      else
+        acc
+        |> check_castling_pseudo(:kingside, castling, king_sq, turn, game, opponent)
+        |> check_castling_pseudo(:queenside, castling, king_sq, turn, game, opponent)
+      end
+    end
+  end
+
+  defp check_castling_pseudo(acc, side, castling, king_sq, turn, game, opponent) do
+    if Game.has_right?(castling, turn, side) and can_castle_pseudo?(side, turn, game, opponent) do
+      target = if side == :kingside, do: king_sq + 2, else: king_sq - 2
+      special = if side == :kingside, do: :kingside_castle, else: :queenside_castle
+      [Move.pack(king_sq, target, nil, special) | acc]
+    else
+      acc
+    end
+  end
+
+  defp can_castle_pseudo?(:kingside, :white, game, opponent) do
+    board_tuple = ensure_tuple(game.board)
+
+    (Board.all_occ(board_tuple) &&& Constants.white_ks_path()) == 0 and
+      not Game.attacked?(game, 61, opponent) and not Game.attacked?(game, 62, opponent)
+  end
+
+  defp can_castle_pseudo?(:queenside, :white, game, opponent) do
+    board_tuple = ensure_tuple(game.board)
+
+    (Board.all_occ(board_tuple) &&& Constants.white_qs_path()) == 0 and
+      not Game.attacked?(game, 59, opponent) and not Game.attacked?(game, 58, opponent)
+  end
+
+  defp can_castle_pseudo?(:kingside, :black, game, opponent) do
+    board_tuple = ensure_tuple(game.board)
+
+    (Board.all_occ(board_tuple) &&& Constants.black_ks_path()) == 0 and
+      not Game.attacked?(game, 5, opponent) and not Game.attacked?(game, 6, opponent)
+  end
+
+  defp can_castle_pseudo?(:queenside, :black, game, opponent) do
+    board_tuple = ensure_tuple(game.board)
+
+    (Board.all_occ(board_tuple) &&& Constants.black_qs_path()) == 0 and
+      not Game.attacked?(game, 3, opponent) and not Game.attacked?(game, 2, opponent)
+  end
+
+  # ── Reverse pawn moves (for generate_moves_targeting) ──
+
   defp reverse_pawn_moves(game, to, :white) do
-    board = game.board
-    white_pawns = board.white_pawns
+    board = ensure_tuple(game.board)
+    white_pawns = Board.wp(board)
     moves = []
 
     moves = add_reverse_single_push(moves, to, white_pawns, board, 8)
@@ -329,8 +1353,8 @@ defmodule Echecs.MoveGen do
   end
 
   defp reverse_pawn_moves(game, to, :black) do
-    board = game.board
-    black_pawns = board.black_pawns
+    board = ensure_tuple(game.board)
+    black_pawns = Board.bp(board)
     moves = []
 
     moves = add_reverse_single_push_black(moves, to, black_pawns, board, -8)
@@ -412,12 +1436,7 @@ defmodule Echecs.MoveGen do
 
   defp add_promo_if_needed(moves, to) do
     rank = div(to, 8)
-
-    if rank == 0 or rank == 7 do
-      expand_promotions(moves)
-    else
-      moves
-    end
+    if rank == 0 or rank == 7, do: expand_promotions(moves), else: moves
   end
 
   defp expand_promotions(moves) do
@@ -435,157 +1454,52 @@ defmodule Echecs.MoveGen do
   defp create_pawn_move(from, to, true), do: Move.pack(from, to, nil, :en_passant)
   defp create_pawn_move(from, to, false), do: Move.pack(from, to, nil, nil)
 
-  defp generate_knight_moves(acc, board, turn, us_bb, target_mask) do
-    knights = if turn == :white, do: Board.wn(board), else: Board.bn(board)
-    do_generate_knight_moves(knights, acc, us_bb, target_mask)
-  end
+  # ── Serialization helpers ──
 
-  defp do_generate_knight_moves(0, acc, _, _), do: acc
+  defp bitboard_to_moves_to(0, _, acc), do: acc
 
-  defp do_generate_knight_moves(knights, acc, us_bb, target_mask) do
-    from = Helper.lsb(knights)
-    attacks = Precomputed.get_knight_attacks(from)
-    # Mask attacks by target_mask (captures or quiets) AND not self-capture (bnot us_bb)
-    # Actually target_mask usually already excludes self-capture if set correctly.
-    # But for safety:
-    valid_moves = attacks &&& target_mask
-
-    acc = bitboard_to_moves_from(valid_moves, from, acc)
-    do_generate_knight_moves(knights &&& knights - 1, acc, us_bb, target_mask)
-  end
-
-  defp generate_sliding_moves(acc, type, board, turn, us_bb, all_bb, target_mask) do
-    bb = get_slider_bb(board, turn, type)
-    do_generate_sliding_moves(bb, acc, type, us_bb, all_bb, target_mask)
-  end
-
-  defp do_generate_sliding_moves(0, acc, _, _, _, _), do: acc
-
-  defp do_generate_sliding_moves(bb, acc, type, us_bb, all_bb, target_mask) do
+  defp bitboard_to_moves_to(bb, to, acc) do
     from = Helper.lsb(bb)
-    attacks = get_slider_attacks(type, from, all_bb)
-    valid_moves = attacks &&& target_mask
-
-    acc = bitboard_to_moves_from(valid_moves, from, acc)
-    do_generate_sliding_moves(bb &&& bb - 1, acc, type, us_bb, all_bb, target_mask)
+    bitboard_to_moves_to(bb &&& bb - 1, to, [Move.pack(from, to, nil, nil) | acc])
   end
 
-  defp generate_king_moves(acc, board, turn, _us_bb, _game, target_mask) do
-    king_bb = if turn == :white, do: Board.wk(board), else: Board.bk(board)
+  defp bitboard_to_moves_from(0, _, acc), do: acc
 
-    if king_bb == 0 do
-      acc
-    else
-      king_sq = Helper.lsb(king_bb)
-      attacks = Precomputed.get_king_attacks(king_sq)
-      valid_moves = attacks &&& target_mask
-
-      bitboard_to_moves_from(valid_moves, king_sq, acc)
-    end
+  defp bitboard_to_moves_from(bb, from, acc) do
+    to = Helper.lsb(bb)
+    bitboard_to_moves_from(bb &&& bb - 1, from, [Move.pack(from, to, nil, nil) | acc])
   end
 
-  defp generate_castling_moves(acc, king_bb, turn, game) do
-    if king_bb == 0 do
-      acc
-    else
-      king_sq = Helper.lsb(king_bb)
-      rights = Map.get(game.castling, turn, [])
-      opponent = Piece.opponent(turn)
+  # ── Piece accessor helpers ──
 
-      if Game.in_check?(game) do
-        acc
-      else
-        acc
-        |> check_castling(:kingside, rights, king_sq, turn, game, opponent)
-        |> check_castling(:queenside, rights, king_sq, turn, game, opponent)
-      end
-    end
+  defp ensure_tuple(board) when is_tuple(board), do: board
+  defp ensure_tuple(board), do: Board.from_struct(board)
+
+  defp get_occupancies(board, :white) do
+    {Board.white_occ(board), Board.black_occ(board), Board.all_occ(board)}
   end
 
-  defp check_castling(acc, side, rights, king_sq, turn, game, opponent) do
-    if side in rights and can_castle?(side, turn, game, opponent) do
-      target = if side == :kingside, do: king_sq + 2, else: king_sq - 2
-      special = if side == :kingside, do: :kingside_castle, else: :queenside_castle
-      [Move.pack(king_sq, target, nil, special) | acc]
-    else
-      acc
-    end
+  defp get_occupancies(board, :black) do
+    {Board.black_occ(board), Board.white_occ(board), Board.all_occ(board)}
   end
 
-  defp can_castle?(:kingside, :white, game, opponent) do
-    kingside_clear?(game.board, :white) and not kingside_attacked?(game, opponent, :white)
-  end
+  defp get_king_bb(board, :white), do: Board.wk(board)
+  defp get_king_bb(board, :black), do: Board.bk(board)
 
-  defp can_castle?(:queenside, :white, game, opponent) do
-    queenside_clear?(game.board, :white) and not queenside_attacked?(game, opponent, :white)
-  end
+  defp get_pawns(board, :white), do: Board.wp(board)
+  defp get_pawns(board, :black), do: Board.bp(board)
 
-  defp can_castle?(:kingside, :black, game, opponent) do
-    kingside_clear?(game.board, :black) and not kingside_attacked?(game, opponent, :black)
-  end
+  defp get_knights(board, :white), do: Board.wn(board)
+  defp get_knights(board, :black), do: Board.bn(board)
 
-  defp can_castle?(:queenside, :black, game, opponent) do
-    queenside_clear?(game.board, :black) and not queenside_attacked?(game, opponent, :black)
-  end
+  defp get_bishops(board, :white), do: Board.wb(board)
+  defp get_bishops(board, :black), do: Board.bb(board)
 
-  defp kingside_clear?(board, :white),
-    do: Board.at(board, 61) == nil and Board.at(board, 62) == nil
+  defp get_rooks(board, :white), do: Board.wr(board)
+  defp get_rooks(board, :black), do: Board.br(board)
 
-  defp kingside_clear?(board, :black), do: Board.at(board, 5) == nil and Board.at(board, 6) == nil
-
-  defp queenside_clear?(board, :white),
-    do: Board.at(board, 59) == nil and Board.at(board, 58) == nil and Board.at(board, 57) == nil
-
-  defp queenside_clear?(board, :black),
-    do: Board.at(board, 3) == nil and Board.at(board, 2) == nil and Board.at(board, 1) == nil
-
-  defp kingside_attacked?(game, opponent, :white) do
-    Game.attacked?(game, 61, opponent) or Game.attacked?(game, 62, opponent)
-  end
-
-  defp kingside_attacked?(game, opponent, :black) do
-    Game.attacked?(game, 5, opponent) or Game.attacked?(game, 6, opponent)
-  end
-
-  defp queenside_attacked?(game, opponent, :white) do
-    Game.attacked?(game, 59, opponent) or Game.attacked?(game, 58, opponent)
-  end
-
-  defp queenside_attacked?(game, opponent, :black) do
-    Game.attacked?(game, 3, opponent) or Game.attacked?(game, 2, opponent)
-  end
-
-  defp legal_int?(game, move_int) do
-    board_tuple = if is_tuple(game.board), do: game.board, else: Board.from_struct(game.board)
-
-    board = Board.make_move_on_board_tuple(board_tuple, move_int, game.turn)
-
-    king_bb = if game.turn == :white, do: Board.wk(board), else: Board.bk(board)
-    king_sq = Helper.lsb(king_bb)
-
-    res =
-      if king_sq do
-        opponent = Piece.opponent(game.turn)
-        not Board.attacked_tuple?(board, king_sq, opponent)
-      else
-        false
-      end
-
-    res
-  end
-
-  defp get_bb_key(:white, :pawn), do: :white_pawns
-  defp get_bb_key(:white, :knight), do: :white_knights
-  defp get_bb_key(:white, :bishop), do: :white_bishops
-  defp get_bb_key(:white, :rook), do: :white_rooks
-  defp get_bb_key(:white, :queen), do: :white_queens
-  defp get_bb_key(:white, :king), do: :white_king
-  defp get_bb_key(:black, :pawn), do: :black_pawns
-  defp get_bb_key(:black, :knight), do: :black_knights
-  defp get_bb_key(:black, :bishop), do: :black_bishops
-  defp get_bb_key(:black, :rook), do: :black_rooks
-  defp get_bb_key(:black, :queen), do: :black_queens
-  defp get_bb_key(:black, :king), do: :black_king
+  defp get_queens(board, :white), do: Board.wq(board)
+  defp get_queens(board, :black), do: Board.bq(board)
 
   defp get_slider_bb(board, :white, :bishop), do: Board.wb(board)
   defp get_slider_bb(board, :white, :rook), do: Board.wr(board)
@@ -599,4 +1513,17 @@ defmodule Echecs.MoveGen do
 
   defp get_slider_attacks(:queen, from, all_bb),
     do: Magic.get_bishop_attacks(from, all_bb) ||| Magic.get_rook_attacks(from, all_bb)
+
+  defp get_piece_bb(board, :white, :pawn), do: Board.wp(board)
+  defp get_piece_bb(board, :white, :knight), do: Board.wn(board)
+  defp get_piece_bb(board, :white, :bishop), do: Board.wb(board)
+  defp get_piece_bb(board, :white, :rook), do: Board.wr(board)
+  defp get_piece_bb(board, :white, :queen), do: Board.wq(board)
+  defp get_piece_bb(board, :white, :king), do: Board.wk(board)
+  defp get_piece_bb(board, :black, :pawn), do: Board.bp(board)
+  defp get_piece_bb(board, :black, :knight), do: Board.bn(board)
+  defp get_piece_bb(board, :black, :bishop), do: Board.bb(board)
+  defp get_piece_bb(board, :black, :rook), do: Board.br(board)
+  defp get_piece_bb(board, :black, :queen), do: Board.bq(board)
+  defp get_piece_bb(board, :black, :king), do: Board.bk(board)
 end

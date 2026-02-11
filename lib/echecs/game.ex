@@ -6,14 +6,44 @@ defmodule Echecs.Game do
   alias Echecs.Bitboard.Helper
   alias Echecs.{Board, FEN, Move, MoveGen, Piece}
   import Bitwise
+  require Echecs.Move
 
-  @type castling_side :: :kingside | :queenside
-  @type castling_rights :: %{white: [castling_side()], black: [castling_side()]}
+  # Castling rights as 4-bit integer
+  # Bit 0 (1): White Kingside
+  # Bit 1 (2): White Queenside
+  # Bit 2 (4): Black Kingside
+  # Bit 3 (8): Black Queenside
+  @wk 1
+  @wq 2
+  @bk 4
+  @bq 8
+
+  # Precomputed mask table for castling updates.
+  # For each square, the mask of castling bits to KEEP when a piece moves from/to that square.
+  # AND-ing castling with mask[from] & mask[to] handles both mover and capture in one step.
+  @castling_masks (for sq <- 0..63 do
+                     cond do
+                       # a8: clear black queenside
+                       sq == 0 -> 15 - @bq
+                       # e8: clear both black
+                       sq == 4 -> 15 - @bk - @bq
+                       # h8: clear black kingside
+                       sq == 7 -> 15 - @bk
+                       # a1: clear white queenside
+                       sq == 56 -> 15 - @wq
+                       # e1: clear both white
+                       sq == 60 -> 15 - @wk - @wq
+                       # h1: clear white kingside
+                       sq == 63 -> 15 - @wk
+                       true -> 15
+                     end
+                   end)
+                  |> List.to_tuple()
 
   @type t :: %__MODULE__{
-          board: Board.t(),
+          board: Board.board_tuple(),
           turn: Piece.color(),
-          castling: castling_rights(),
+          castling: non_neg_integer(),
           en_passant: Board.square() | nil,
           halfmove: non_neg_integer(),
           fullmove: pos_integer(),
@@ -22,9 +52,9 @@ defmodule Echecs.Game do
           king_pos: %{white: Board.square() | nil, black: Board.square() | nil}
         }
 
-  defstruct board: Board.new(),
+  defstruct board: nil,
             turn: :white,
-            castling: %{white: [:kingside, :queenside], black: [:kingside, :queenside]},
+            castling: 15,
             en_passant: nil,
             halfmove: 0,
             fullmove: 1,
@@ -40,34 +70,52 @@ defmodule Echecs.Game do
   @spec new(String.t()) :: t()
   def new(fen \\ @start_fen) do
     parsed = FEN.parse(fen)
+    board = ensure_tuple(parsed.board)
 
     king_pos = %{
-      white: find_king_scan(parsed.board, :white),
-      black: find_king_scan(parsed.board, :black)
+      white: find_king_sq(board, :white),
+      black: find_king_sq(board, :black)
     }
 
-    initial_state = {parsed.board, parsed.turn, parsed.castling, parsed.en_passant}
+    initial_state = {board, parsed.turn, parsed.castling, parsed.en_passant}
 
-    struct(__MODULE__, Map.merge(parsed, %{history: [initial_state], king_pos: king_pos}))
+    struct(
+      __MODULE__,
+      Map.merge(parsed, %{board: board, history: [initial_state], king_pos: king_pos})
+    )
   end
 
-  defp find_king_scan(board, color) do
-    0..63
-    |> Enum.find(fn i -> Board.at(board, i) == {color, :king} end)
+  defp find_king_sq(board, :white) do
+    king_bb = Board.wk(board)
+    if king_bb != 0, do: Helper.lsb(king_bb), else: nil
   end
+
+  defp find_king_sq(board, :black) do
+    king_bb = Board.bk(board)
+    if king_bb != 0, do: Helper.lsb(king_bb), else: nil
+  end
+
+  defp ensure_tuple(board) when is_tuple(board), do: board
+  defp ensure_tuple(board), do: Board.from_struct(board)
 
   @doc """
-  Executes a move on the game state. 
+  Executes a move on the game state.
   Assumes the move is pseudo-legal (does not check validity).
   Used for 'make_move' and legal move verification.
   """
   def make_move(%__MODULE__{} = game, %Move{} = move) do
-    piece = Board.at(game.board, move.from)
-    target_piece = Board.at(game.board, move.to)
+    board = game.board
+    piece = Board.at_tuple(board, move.from)
+    target_piece = Board.at_tuple(board, move.to)
 
-    board = apply_move_to_board(game.board, move, piece, game.turn)
+    packed = Move.pack(move.from, move.to, move.promotion, move.special)
+    new_board = Board.make_move_on_board_tuple(board, packed, game.turn)
+
     next_turn = Piece.opponent(game.turn)
-    castling = update_castling_rights(game.castling, piece, move.from, target_piece, move.to)
+
+    castling =
+      game.castling &&& elem(@castling_masks, move.from) &&& elem(@castling_masks, move.to)
+
     en_passant = calculate_en_passant(piece, move)
     halfmove = update_halfmove(game.halfmove, piece, target_piece)
     fullmove = if game.turn == :black, do: game.fullmove + 1, else: game.fullmove
@@ -86,7 +134,7 @@ defmodule Echecs.Game do
 
     %__MODULE__{
       game
-      | board: board,
+      | board: new_board,
         turn: next_turn,
         castling: castling,
         en_passant: en_passant,
@@ -96,30 +144,6 @@ defmodule Echecs.Game do
         zobrist_hash: new_hash,
         king_pos: king_pos
     }
-  end
-
-  defp apply_move_to_board(board, move, piece, turn) do
-    board =
-      board
-      |> Board.put(move.from, nil)
-      |> Board.put(move.to, update_piece(piece, move))
-
-    cond do
-      move.special == :en_passant ->
-        capture_idx = if turn == :white, do: move.to + 8, else: move.to - 8
-        Board.put(board, capture_idx, nil)
-
-      move.special in [:kingside_castle, :queenside_castle] ->
-        {rook_from, rook_to} = castling_rook_move(move.special, turn)
-        rook = Board.at(board, rook_from)
-
-        board
-        |> Board.put(rook_from, nil)
-        |> Board.put(rook_to, rook)
-
-      true ->
-        board
-    end
   end
 
   defp calculate_en_passant({_, :pawn}, %Move{from: from, to: to}) when abs(from - to) == 16 do
@@ -137,59 +161,6 @@ defmodule Echecs.Game do
   end
 
   defp update_king_pos(king_pos, _, _, _), do: king_pos
-
-  defp update_piece({color, :pawn}, %Move{promotion: type}) when not is_nil(type) do
-    {color, type}
-  end
-
-  defp update_piece(piece, _), do: piece
-
-  defp castling_rook_move(:kingside_castle, :white), do: {63, 61}
-  defp castling_rook_move(:queenside_castle, :white), do: {56, 59}
-  defp castling_rook_move(:kingside_castle, :black), do: {7, 5}
-  defp castling_rook_move(:queenside_castle, :black), do: {0, 3}
-
-  defp update_castling_rights(castling, {color, type}, from, target_piece, to) do
-    castling
-    |> update_rights_for_mover(color, type, from)
-    |> update_rights_for_capture(target_piece, to)
-  end
-
-  defp update_rights_for_mover(castling, color, :king, _) do
-    Map.put(castling, color, [])
-  end
-
-  defp update_rights_for_mover(castling, color, :rook, from) do
-    remove_right_for_square(castling, color, from)
-  end
-
-  defp update_rights_for_mover(castling, _, _, _), do: castling
-
-  defp update_rights_for_capture(castling, nil, _), do: castling
-
-  defp update_rights_for_capture(castling, {captured_color, :rook}, to) do
-    remove_right_for_square(castling, captured_color, to)
-  end
-
-  defp update_rights_for_capture(castling, _, _), do: castling
-
-  defp remove_right_for_square(castling, :white, 63),
-    do: remove_right(castling, :white, :kingside)
-
-  defp remove_right_for_square(castling, :white, 56),
-    do: remove_right(castling, :white, :queenside)
-
-  defp remove_right_for_square(castling, :black, 7), do: remove_right(castling, :black, :kingside)
-
-  defp remove_right_for_square(castling, :black, 0),
-    do: remove_right(castling, :black, :queenside)
-
-  defp remove_right_for_square(castling, _, _), do: castling
-
-  defp remove_right(castling, color, side) do
-    rights = Map.get(castling, color, [])
-    Map.put(castling, color, List.delete(rights, side))
-  end
 
   @doc """
   Verifies if a move is legal without generating all other legal moves.
@@ -214,7 +185,7 @@ defmodule Echecs.Game do
   Returns true if the current side to move is in check.
   """
   def in_check?(game) do
-    king_pos = game.king_pos[game.turn] || find_king_scan(game.board, game.turn)
+    king_pos = game.king_pos[game.turn] || find_king_sq(game.board, game.turn)
     attacked?(game, king_pos, Piece.opponent(game.turn))
   end
 
@@ -237,7 +208,7 @@ defmodule Echecs.Game do
   end
 
   defp no_legal_moves?(game) do
-    MoveGen.legal_moves(game) == []
+    not MoveGen.has_legal_move?(game)
   end
 
   @doc """
@@ -252,12 +223,23 @@ defmodule Echecs.Game do
   defp repetition?(game) do
     current_hash = game.zobrist_hash
 
-    Enum.count(game.history, &(&1 == current_hash)) >= 2
+    # Only need to search back to the last irreversible move (halfmove clock)
+    # and count 2-fold repetition (sufficient for playing)
+    game.history
+    |> Enum.take(game.halfmove)
+    |> count_matches(current_hash, 0)
+  end
+
+  defp count_matches(_, _hash, 2), do: true
+  defp count_matches([], _hash, _count), do: false
+
+  defp count_matches([h | rest], hash, count) do
+    count_matches(rest, hash, if(h == hash, do: count + 1, else: count))
   end
 
   defp insufficient_material?(game) do
     board = game.board
-    all_pieces = board.all_pieces
+    all_pieces = Board.all_occ(board)
     count = Helper.pop_count(all_pieces)
 
     cond do
@@ -266,15 +248,15 @@ defmodule Echecs.Game do
 
       count == 3 ->
         majors =
-          board.white_rooks ||| board.white_queens ||| board.white_pawns |||
-            board.black_rooks ||| board.black_queens ||| board.black_pawns
+          Board.wr(board) ||| Board.wq(board) ||| Board.wp(board) |||
+            Board.br(board) ||| Board.bq(board) ||| Board.bp(board)
 
         majors == 0
 
       count == 4 ->
         others =
-          board.white_rooks ||| board.white_queens ||| board.white_pawns ||| board.white_knights |||
-            board.black_rooks ||| board.black_queens ||| board.black_pawns ||| board.black_knights
+          Board.wr(board) ||| Board.wq(board) ||| Board.wp(board) ||| Board.wn(board) |||
+            Board.br(board) ||| Board.bq(board) ||| Board.bp(board) ||| Board.bn(board)
 
         if others == 0 do
           check_bishops_same_color(board)
@@ -288,10 +270,12 @@ defmodule Echecs.Game do
   end
 
   defp check_bishops_same_color(board) do
-    if Helper.pop_count(board.white_bishops) == 1 and
-         Helper.pop_count(board.black_bishops) == 1 do
-      w_bishop_sq = Helper.lsb(board.white_bishops)
-      b_bishop_sq = Helper.lsb(board.black_bishops)
+    wb = Board.wb(board)
+    bb = Board.bb(board)
+
+    if Helper.pop_count(wb) == 1 and Helper.pop_count(bb) == 1 do
+      w_bishop_sq = Helper.lsb(wb)
+      b_bishop_sq = Helper.lsb(bb)
 
       wc = square_color(w_bishop_sq)
       bc = square_color(b_bishop_sq)
@@ -307,4 +291,12 @@ defmodule Echecs.Game do
     file = rem(idx, 8)
     rem(rank + file, 2)
   end
+
+  @compile {:inline, has_right?: 3}
+
+  # Castling rights helpers (public for move_gen access)
+  def has_right?(castling, :white, :kingside), do: (castling &&& @wk) != 0
+  def has_right?(castling, :white, :queenside), do: (castling &&& @wq) != 0
+  def has_right?(castling, :black, :kingside), do: (castling &&& @bk) != 0
+  def has_right?(castling, :black, :queenside), do: (castling &&& @bq) != 0
 end
