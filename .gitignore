@@ -39,6 +39,7 @@ package.json
 package-lock.json
 npm-debug.log
 test/comparison/
+test/integration/chesscom_db_test.exs
 /_build
 /deps
 /.elixir_ls

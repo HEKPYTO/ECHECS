@@ -27,10 +27,20 @@ Add `echecs` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:echecs, "~> 0.1.2"}
+    {:echecs, "~> 0.1.3"}
   ]
 end
 ```
+
+## Changelog
+
+### v0.1.3 (Phase 6 Optimization)
+*   **Performance:** ~22% throughput increase (up to 4,100 games/sec).
+*   **Zero-Allocation Legality Check:** Replaced struct-based move validation with optimized integer bitboard operations to eliminate GC pressure on the hot path.
+*   **Tuple Board Representation:** Switched internal board state from Maps to Tuples for faster access and updates.
+*   **Recursive Move Generation:** Replaced high-order functions with specialized recursive loops to reduce function call overhead.
+*   **Inlining & Macro Optimization:** Critical bitwise helpers and constants are now inlined at compile time.
+*   **Test Suite Overhaul:** Flattened test structure and added a comprehensive **Perft Suite** for rigorous correctness verification.
 
 ## Quick Start
 

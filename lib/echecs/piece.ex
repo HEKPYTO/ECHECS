@@ -10,6 +10,8 @@ defmodule Echecs.Piece do
   @colors [:white, :black]
   @types [:pawn, :knight, :bishop, :rook, :queen, :king]
 
+  @compile {:inline, opponent: 1}
+
   def colors, do: @colors
   def types, do: @types
 

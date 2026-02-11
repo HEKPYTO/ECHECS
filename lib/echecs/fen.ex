@@ -1,16 +1,12 @@
 defmodule Echecs.FEN do
   @moduledoc """
-  Handles parsing and generation of Forsyth–Edwards Notation (FEN) strings.
+  Handles parsing and generation of Forsyth-Edwards Notation (FEN) strings.
   """
 
   alias Echecs.{Board, Piece}
+  import Bitwise
 
   @type fen :: String.t()
-  @type board_tuple :: tuple()
-  @type castling_rights :: %{
-          white: list(:kingside | :queenside),
-          black: list(:kingside | :queenside)
-        }
 
   @doc """
   Parses a FEN string into its components.
@@ -52,19 +48,19 @@ defmodule Echecs.FEN do
   defp parse_turn("w"), do: :white
   defp parse_turn("b"), do: :black
 
-  defp parse_castling("-"), do: %{white: [], black: []}
+  # Castling rights as 4-bit integer
+  # Bit 0 (1): White Kingside
+  # Bit 1 (2): White Queenside
+  # Bit 2 (4): Black Kingside
+  # Bit 3 (8): Black Queenside
+  defp parse_castling("-"), do: 0
 
   defp parse_castling(str) do
-    %{
-      white: parse_rights(str, "K", "Q"),
-      black: parse_rights(str, "k", "q")
-    }
-  end
-
-  defp parse_rights(str, k, q) do
-    []
-    |> then(&if String.contains?(str, q), do: [:queenside | &1], else: &1)
-    |> then(&if String.contains?(str, k), do: [:kingside | &1], else: &1)
+    r = 0
+    r = if String.contains?(str, "K"), do: r ||| 1, else: r
+    r = if String.contains?(str, "Q"), do: r ||| 2, else: r
+    r = if String.contains?(str, "k"), do: r ||| 4, else: r
+    if String.contains?(str, "q"), do: r ||| 8, else: r
   end
 
   defp parse_en_passant("-"), do: nil
@@ -102,15 +98,15 @@ defmodule Echecs.FEN do
     end)
   end
 
+  defp generate_castling(0), do: "-"
+
   defp generate_castling(rights) do
-    w_str = rights_to_str(rights.white, "K", "Q")
-    b_str = rights_to_str(rights.black, "k", "q")
+    res =
+      if((rights &&& 1) != 0, do: "K", else: "") <>
+        if((rights &&& 2) != 0, do: "Q", else: "") <>
+        if((rights &&& 4) != 0, do: "k", else: "") <>
+        if (rights &&& 8) != 0, do: "q", else: ""
 
-    res = w_str <> b_str
     if res == "", do: "-", else: res
-  end
-
-  defp rights_to_str(list, k, q) do
-    if(:kingside in list, do: k, else: "") <> if :queenside in list, do: q, else: ""
   end
 end
