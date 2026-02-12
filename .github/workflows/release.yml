@@ -35,6 +35,9 @@ jobs:
       - name: Compile
         run: mix compile --warnings-as-errors
         
+      - name: Generate Magic Cache
+        run: mix run -e "Echecs.Bitboard.Magic.init()"
+        
       - name: Run Core Tests
         run: mix test
         
