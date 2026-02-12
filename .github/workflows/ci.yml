@@ -40,5 +40,8 @@ jobs:
       - name: Run Credo Lint
         run: mix credo --strict
         
+      - name: Generate Magic Cache
+        run: mix run -e "Echecs.Bitboard.Magic.init()"
+        
       - name: Run Core Tests
         run: mix test

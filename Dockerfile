@@ -15,6 +15,7 @@ RUN mix deps.compile
 
 COPY lib lib
 RUN mix compile
+RUN mix run -e "Echecs.Bitboard.Magic.init()"
 
 FROM elixir:alpine AS runner
 
@@ -38,5 +39,6 @@ COPY --from=builder --chown=echecs:echecs /app/deps ./deps
 COPY --from=builder --chown=echecs:echecs /app/mix.exs .
 COPY --from=builder --chown=echecs:echecs /app/mix.lock .
 COPY --from=builder --chown=echecs:echecs /app/lib ./lib
+COPY --from=builder --chown=echecs:echecs /app/priv ./priv
 
 CMD ["iex", "-S", "mix", "run", "--no-start"]
