@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/HEKPYTO/ECHECS/actions/workflows/ci.yml/badge.svg)](https://github.com/HEKPYTO/ECHECS/actions/workflows/ci.yml)
 
-Echecs is a robust chess library designed for speed and correctness. It leverages advanced optimization techniques available on the BEAM virtual machine, making it suitable for high-throughput analysis and scalable applications.
+Echecs is a robust chess library designed for speed and correctness. It leverages advanced optimization techniques available on the BEAM virtual machine (Bitboards, Magic Bitboards, Integer packing, etc), making it suitable for high-throughput analysis and scalable applications.
 
 ## Features
 
@@ -31,16 +31,6 @@ def deps do
   ]
 end
 ```
-
-## Changelog
-
-### v0.1.3 (Phase 6 Optimization)
-*   **Performance:** ~22% throughput increase (up to 4,100 games/sec).
-*   **Zero-Allocation Legality Check:** Replaced struct-based move validation with optimized integer bitboard operations to eliminate GC pressure on the hot path.
-*   **Tuple Board Representation:** Switched internal board state from Maps to Tuples for faster access and updates.
-*   **Recursive Move Generation:** Replaced high-order functions with specialized recursive loops to reduce function call overhead.
-*   **Inlining & Macro Optimization:** Critical bitwise helpers and constants are now inlined at compile time.
-*   **Test Suite Overhaul:** Flattened test structure and added a comprehensive **Perft Suite** for rigorous correctness verification.
 
 ## Quick Start
 
@@ -73,6 +63,25 @@ game = Echecs.new_game("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c
 Echecs.FEN.to_string(game)
 ```
 
+### PGN Parsing
+
+```elixir
+# Parse and replay a PGN game
+pgn = "1. e4 e5 2. Nf3 Nc6 3. Bb5"
+moves = Echecs.PGN.parse_moves(pgn)
+final_game = Echecs.PGN.replay(Echecs.new_game(), moves)
+```
+
+## Advanced Usage
+
+### Performance Considerations
+
+Echecs is designed to be extremely memory-efficient. The `Echecs.MoveGen.legal_moves_int/1` function returns moves as packed integers instead of structs, which is ideal for tight loops or search algorithms (e.g. Minimax) where struct allocation overhead is significant.
+
+### Internal Board Representation
+
+The board is represented internally as a Tuple of integers (Bitboards) for maximum access speed on the BEAM. This allows the engine to query piece locations and attack maps in constant time.
+
 ## Testing & Benchmarks
 
 The engine is verified against millions of real-world games from the Lichess database to ensure correctness and stability.
@@ -91,11 +100,9 @@ To verify performance on your machine:
 LICHESS_DB_PATH=path/to/file.pgn.zst mix test --include integration test/integration/lichess_db_test.exs
 ```
 
-*Current Benchmark:* ~254s for 1,000,000 games (~3,924 games/sec).
-
 ## Docker Support
 
-Deploy or test in a consistent environment using the provided Docker image.
+Deploy or test in a consistent environment using the provided Docker image. The image automatically pre-generates the magic bitboard cache for faster startup.
 
 ```bash
 # Build
@@ -105,7 +112,3 @@ docker build -t echecs .
 docker run -it --rm echecs
 iex> Echecs.new_game()
 ```
-
-## License
-
-This project is licensed under the MIT License.
