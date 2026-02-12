@@ -35,10 +35,10 @@ jobs:
       - name: Compile
         run: mix compile
         
+      - name: Generate Magic Cache
+        run: mix run -e "Echecs.Bitboard.Magic.init()"
+        
       - name: Download Lichess DB Sample (2015-01)
-        # Using a mid-sized monthly file for CI/CD speed (~270MB)
-        # Lichess DB files are typically named lichess_db_standard_rated_YYYY-MM.pgn.zst
-        # We'll use 2015-01 which is more up-to-date than 2013 but still manageable
         run: |
           echo "Attempting to download Lichess DB..."
           wget -q --spider https://database.lichess.org/standard/lichess_db_standard_rated_2015-01.pgn.zst
