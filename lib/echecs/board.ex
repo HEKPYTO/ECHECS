@@ -7,6 +7,8 @@ defmodule Echecs.Board do
   require Echecs.Bitboard.Constants
   alias Echecs.Bitboard.{Constants, Magic, Precomputed}
 
+  @mask64 0xFFFFFFFFFFFFFFFF
+
   # 0: white_pawns, 1: white_knights, 2: white_bishops, 3: white_rooks, 4: white_queens, 5: white_king
   # 6: black_pawns, 7: black_knights, 8: black_bishops, 9: black_rooks, 10: black_queens, 11: black_king
   # 12: white_pieces, 13: black_pieces, 14: all_pieces
@@ -259,7 +261,7 @@ defmodule Echecs.Board do
 
   @doc """
   Applies a move to the bitboards only. Used for fast legality checking.
-  Returns the updated board struct.
+  Returns the updated board tuple. Single-write: destructures once, constructs one new tuple.
   """
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def make_move_on_board_tuple(board, move, turn) do
@@ -271,120 +273,204 @@ defmodule Echecs.Board do
     from_mask = 1 <<< from
     to_mask = 1 <<< to
 
-    # We need fast type lookup on tuple
-    piece_type = find_piece_type_on_tuple(board, turn, from_mask)
+    {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, w_occ, b_occ, _a_occ} = board
 
-    # 1. Update mover
-    board =
+    # Determine mover's piece type index
+    {mover_idx, _piece_type} = find_piece_idx_and_type(board, turn, from_mask)
+
+    # 1. Apply mover update
+    {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11} =
       if promotion do
-        board
-        |> update_tuple(turn, piece_type, from_mask, :clear)
-        |> update_tuple(turn, promotion, to_mask, :set)
+        promo_idx = tuple_index(turn, promotion)
+        pieces = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11}
+        # Clear piece from origin
+        pieces =
+          put_piece_elem(
+            pieces,
+            mover_idx,
+            elem(pieces, mover_idx) &&& bnot(from_mask) &&& @mask64
+          )
+
+        # Set promoted piece at destination
+        put_piece_elem(pieces, promo_idx, elem(pieces, promo_idx) ||| to_mask)
       else
         move_mask = from_mask ||| to_mask
-        update_tuple(board, turn, piece_type, move_mask, :xor)
+        pieces = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11}
+        put_piece_elem(pieces, mover_idx, bxor(elem(pieces, mover_idx), move_mask))
       end
 
-    # 2. Update capture
-    opponent = if turn == :white, do: :black, else: :white
+    # 2. Handle capture
+    opp_occ = if turn == :white, do: b_occ, else: w_occ
 
-    board =
+    {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, new_w, new_b} =
       cond do
         special == :en_passant ->
-          cap_sq = if turn == :white, do: to + 8, else: to - 8
-          update_tuple(board, opponent, :pawn, 1 <<< cap_sq, :clear)
+          cap_mask = if turn == :white, do: 1 <<< (to + 8), else: 1 <<< (to - 8)
+          cap_idx = if turn == :white, do: 6, else: 0
+          pieces = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11}
 
-        (elem(board, 14) &&& to_mask) != 0 ->
-          captured_type = find_piece_type_on_tuple(board, opponent, to_mask)
+          {cp0, cp1, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11} =
+            put_piece_elem(pieces, cap_idx, elem(pieces, cap_idx) &&& bnot(cap_mask) &&& @mask64)
 
-          if captured_type do
-            update_tuple(board, opponent, captured_type, to_mask, :clear)
+          # Incremental: mover XOR from+to, opponent clear cap_mask
+          if turn == :white do
+            {cp0, cp1, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11,
+             bxor(w_occ, from_mask ||| to_mask), b_occ &&& bnot(cap_mask) &&& @mask64}
           else
-            board
+            {cp0, cp1, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11,
+             w_occ &&& bnot(cap_mask) &&& @mask64, bxor(b_occ, from_mask ||| to_mask)}
+          end
+
+        (opp_occ &&& to_mask) != 0 ->
+          # Standard capture: find and clear the captured piece
+          opp_start = if turn == :white, do: 6, else: 0
+          pieces = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11}
+          clear_mask = bnot(to_mask) &&& @mask64
+
+          {cp0, cp1, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11} =
+            clear_captured_piece(pieces, opp_start, to_mask, clear_mask)
+
+          # Mover: XOR from, set to (= XOR from, OR to works since we own to after capture)
+          # Opponent: clear to
+          if turn == :white do
+            {cp0, cp1, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11,
+             bxor(w_occ, from_mask) ||| to_mask, b_occ &&& clear_mask}
+          else
+            {cp0, cp1, cp2, cp3, cp4, cp5, cp6, cp7, cp8, cp9, cp10, cp11, w_occ &&& clear_mask,
+             bxor(b_occ, from_mask) ||| to_mask}
           end
 
         true ->
-          board
-      end
+          # Quiet move: just XOR from+to on mover's occupancy
+          move_mask = from_mask ||| to_mask
 
-    # 3. Handle Castling
-    board =
-      if special in [:kingside_castle, :queenside_castle] do
-        {r_from, r_to} =
-          case {special, turn} do
-            {:kingside_castle, :white} -> {63, 61}
-            {:queenside_castle, :white} -> {56, 59}
-            {:kingside_castle, :black} -> {7, 5}
-            {:queenside_castle, :black} -> {0, 3}
+          if turn == :white do
+            {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, bxor(w_occ, move_mask), b_occ}
+          else
+            {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, w_occ, bxor(b_occ, move_mask)}
           end
-
-        r_mask = 1 <<< r_from ||| 1 <<< r_to
-        update_tuple(board, turn, :rook, r_mask, :xor)
-      else
-        board
       end
 
-    update_tuple_aggregates(board)
+    # 3. Handle castling rook
+    {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, new_w, new_b} =
+      case special do
+        :kingside_castle ->
+          {r_from, r_to} = if turn == :white, do: {63, 61}, else: {7, 5}
+          r_mask = 1 <<< r_from ||| 1 <<< r_to
+          rook_idx = if turn == :white, do: 3, else: 9
+          pieces = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11}
+
+          {rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7, rp8, rp9, rp10, rp11} =
+            put_piece_elem(pieces, rook_idx, bxor(elem(pieces, rook_idx), r_mask))
+
+          occ =
+            if turn == :white,
+              do: {bxor(new_w, r_mask), new_b},
+              else: {new_w, bxor(new_b, r_mask)}
+
+          {rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7, rp8, rp9, rp10, rp11, elem(occ, 0),
+           elem(occ, 1)}
+
+        :queenside_castle ->
+          {r_from, r_to} = if turn == :white, do: {56, 59}, else: {0, 3}
+          r_mask = 1 <<< r_from ||| 1 <<< r_to
+          rook_idx = if turn == :white, do: 3, else: 9
+          pieces = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11}
+
+          {rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7, rp8, rp9, rp10, rp11} =
+            put_piece_elem(pieces, rook_idx, bxor(elem(pieces, rook_idx), r_mask))
+
+          occ =
+            if turn == :white,
+              do: {bxor(new_w, r_mask), new_b},
+              else: {new_w, bxor(new_b, r_mask)}
+
+          {rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7, rp8, rp9, rp10, rp11, elem(occ, 0),
+           elem(occ, 1)}
+
+        _ ->
+          {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, new_w, new_b}
+      end
+
+    {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, new_w, new_b, new_w ||| new_b}
   end
 
-  defp update_tuple(board, color, type, mask, op) do
-    idx = tuple_index(color, type)
-    val = elem(board, idx)
-    new_val = apply_op(val, mask, op)
-    put_elem(board, idx, new_val)
+  # Returns {index, piece_type} for the piece at from_mask
+  @compile {:inline, find_piece_idx_and_type: 3}
+  defp find_piece_idx_and_type(board, :white, mask) do
+    cond do
+      (elem(board, 0) &&& mask) != 0 -> {0, :pawn}
+      (elem(board, 1) &&& mask) != 0 -> {1, :knight}
+      (elem(board, 2) &&& mask) != 0 -> {2, :bishop}
+      (elem(board, 3) &&& mask) != 0 -> {3, :rook}
+      (elem(board, 4) &&& mask) != 0 -> {4, :queen}
+      (elem(board, 5) &&& mask) != 0 -> {5, :king}
+    end
   end
 
-  defp tuple_index(:white, :pawn), do: 0
+  defp find_piece_idx_and_type(board, :black, mask) do
+    cond do
+      (elem(board, 6) &&& mask) != 0 -> {6, :pawn}
+      (elem(board, 7) &&& mask) != 0 -> {7, :knight}
+      (elem(board, 8) &&& mask) != 0 -> {8, :bishop}
+      (elem(board, 9) &&& mask) != 0 -> {9, :rook}
+      (elem(board, 10) &&& mask) != 0 -> {10, :queen}
+      (elem(board, 11) &&& mask) != 0 -> {11, :king}
+    end
+  end
+
+  # Update a single element in a 12-element piece tuple
+  @compile {:inline, put_piece_elem: 3}
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp put_piece_elem({e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11}, idx, val) do
+    case idx do
+      0 -> {val, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11}
+      1 -> {e0, val, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11}
+      2 -> {e0, e1, val, e3, e4, e5, e6, e7, e8, e9, e10, e11}
+      3 -> {e0, e1, e2, val, e4, e5, e6, e7, e8, e9, e10, e11}
+      4 -> {e0, e1, e2, e3, val, e5, e6, e7, e8, e9, e10, e11}
+      5 -> {e0, e1, e2, e3, e4, val, e6, e7, e8, e9, e10, e11}
+      6 -> {e0, e1, e2, e3, e4, e5, val, e7, e8, e9, e10, e11}
+      7 -> {e0, e1, e2, e3, e4, e5, e6, val, e8, e9, e10, e11}
+      8 -> {e0, e1, e2, e3, e4, e5, e6, e7, val, e9, e10, e11}
+      9 -> {e0, e1, e2, e3, e4, e5, e6, e7, e8, val, e10, e11}
+      10 -> {e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, val, e11}
+      11 -> {e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, val}
+    end
+  end
+
+  # Clear captured piece from opponent's bitboards
+  @compile {:inline, clear_captured_piece: 4}
+  defp clear_captured_piece(pieces, start, to_mask, clear_mask) do
+    cond do
+      (elem(pieces, start) &&& to_mask) != 0 ->
+        put_piece_elem(pieces, start, elem(pieces, start) &&& clear_mask)
+
+      (elem(pieces, start + 1) &&& to_mask) != 0 ->
+        put_piece_elem(pieces, start + 1, elem(pieces, start + 1) &&& clear_mask)
+
+      (elem(pieces, start + 2) &&& to_mask) != 0 ->
+        put_piece_elem(pieces, start + 2, elem(pieces, start + 2) &&& clear_mask)
+
+      (elem(pieces, start + 3) &&& to_mask) != 0 ->
+        put_piece_elem(pieces, start + 3, elem(pieces, start + 3) &&& clear_mask)
+
+      (elem(pieces, start + 4) &&& to_mask) != 0 ->
+        put_piece_elem(pieces, start + 4, elem(pieces, start + 4) &&& clear_mask)
+
+      true ->
+        pieces
+    end
+  end
+
   defp tuple_index(:white, :knight), do: 1
   defp tuple_index(:white, :bishop), do: 2
   defp tuple_index(:white, :rook), do: 3
   defp tuple_index(:white, :queen), do: 4
-  defp tuple_index(:white, :king), do: 5
-  defp tuple_index(:black, :pawn), do: 6
   defp tuple_index(:black, :knight), do: 7
   defp tuple_index(:black, :bishop), do: 8
   defp tuple_index(:black, :rook), do: 9
   defp tuple_index(:black, :queen), do: 10
-  defp tuple_index(:black, :king), do: 11
-
-  defp find_piece_type_on_tuple(board, :white, mask) do
-    cond do
-      (elem(board, 0) &&& mask) != 0 -> :pawn
-      (elem(board, 1) &&& mask) != 0 -> :knight
-      (elem(board, 2) &&& mask) != 0 -> :bishop
-      (elem(board, 3) &&& mask) != 0 -> :rook
-      (elem(board, 4) &&& mask) != 0 -> :queen
-      (elem(board, 5) &&& mask) != 0 -> :king
-      true -> nil
-    end
-  end
-
-  defp find_piece_type_on_tuple(board, :black, mask) do
-    cond do
-      (elem(board, 6) &&& mask) != 0 -> :pawn
-      (elem(board, 7) &&& mask) != 0 -> :knight
-      (elem(board, 8) &&& mask) != 0 -> :bishop
-      (elem(board, 9) &&& mask) != 0 -> :rook
-      (elem(board, 10) &&& mask) != 0 -> :queen
-      (elem(board, 11) &&& mask) != 0 -> :king
-      true -> nil
-    end
-  end
-
-  defp update_tuple_aggregates(board) do
-    white =
-      elem(board, 0) ||| elem(board, 1) ||| elem(board, 2) |||
-        elem(board, 3) ||| elem(board, 4) ||| elem(board, 5)
-
-    black =
-      elem(board, 6) ||| elem(board, 7) ||| elem(board, 8) |||
-        elem(board, 9) ||| elem(board, 10) ||| elem(board, 11)
-
-    board
-    |> put_elem(12, white)
-    |> put_elem(13, black)
-    |> put_elem(14, white ||| black)
-  end
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def make_move_on_bitboards(board, move, turn) do
