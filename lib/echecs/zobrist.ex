@@ -131,6 +131,32 @@ defmodule Echecs.Zobrist do
     |> update_special_moves(move, piece, turn, keys)
   end
 
+  @doc """
+  Incremental Zobrist hash update using unpacked move fields (no struct needed).
+  """
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  def update_hash_int(
+        current_hash,
+        from,
+        to,
+        promotion,
+        special,
+        piece,
+        target_piece,
+        {old_castling, new_castling},
+        {old_ep, new_ep},
+        turn
+      ) do
+    keys = :persistent_term.get(@key)
+
+    current_hash
+    |> bxor(elem(keys, side_index()))
+    |> update_ep(old_ep, new_ep, keys)
+    |> update_castling_hash(old_castling, new_castling)
+    |> update_pieces_int(from, to, promotion, piece, target_piece, keys)
+    |> update_special_moves_int(special, to, piece, turn, keys)
+  end
+
   defp update_ep(h, old_ep, new_ep, keys) do
     h = if old_ep, do: bxor(h, elem(keys, ep_index(rem(old_ep, 8)))), else: h
     if new_ep, do: bxor(h, elem(keys, ep_index(rem(new_ep, 8)))), else: h
@@ -168,6 +194,23 @@ defmodule Echecs.Zobrist do
     end
   end
 
+  defp update_pieces_int(h, from, to, promotion, {c, t}, target_piece, keys) do
+    idx_from = piece_index(c, t, from)
+    h = bxor(h, elem(keys, idx_from))
+
+    final_type = promotion || t
+    idx_to = piece_index(c, final_type, to)
+    h = bxor(h, elem(keys, idx_to))
+
+    if target_piece do
+      {tc, tt} = target_piece
+      idx_target = piece_index(tc, tt, to)
+      bxor(h, elem(keys, idx_target))
+    else
+      h
+    end
+  end
+
   defp update_special_moves(h, move, {c, _}, turn, keys) do
     cond do
       move.special == :en_passant ->
@@ -186,6 +229,23 @@ defmodule Echecs.Zobrist do
         h
     end
   end
+
+  defp update_special_moves_int(h, :en_passant, to, {c, _}, turn, keys) do
+    cap_sq = if turn == :white, do: to + 8, else: to - 8
+    op_c = if c == :white, do: :black, else: :white
+    idx = piece_index(op_c, :pawn, cap_sq)
+    bxor(h, elem(keys, idx))
+  end
+
+  defp update_special_moves_int(h, :kingside_castle, _to, {c, _}, _turn, keys) do
+    update_castle_rooks(h, c, :kingside, keys)
+  end
+
+  defp update_special_moves_int(h, :queenside_castle, _to, {c, _}, _turn, keys) do
+    update_castle_rooks(h, c, :queenside, keys)
+  end
+
+  defp update_special_moves_int(h, _, _to, _piece, _turn, _keys), do: h
 
   defp update_castle_rooks(h, c, side, keys) do
     {r_from, r_to} =

@@ -254,40 +254,48 @@ defmodule Echecs.MoveGen do
       end
 
     # Knight attacks
-    danger =
-      or_piece_attacks(
-        danger,
-        get_knights(board, attacker_color),
-        &Precomputed.get_knight_attacks/1
-      )
+    danger = or_knight_attacks(danger, get_knights(board, attacker_color))
 
     # Bishop + Queen diagonal attacks (using occ_no_king)
     enemy_bq = get_bishops(board, attacker_color) ||| get_queens(board, attacker_color)
-    danger = or_slider_attacks(danger, enemy_bq, occ_no_king, &Magic.get_bishop_attacks/2)
+    danger = or_bishop_attacks(danger, enemy_bq, occ_no_king)
 
     # Rook + Queen HV attacks (using occ_no_king)
     enemy_rq = get_rooks(board, attacker_color) ||| get_queens(board, attacker_color)
-    danger = or_slider_attacks(danger, enemy_rq, occ_no_king, &Magic.get_rook_attacks/2)
+    danger = or_rook_attacks(danger, enemy_rq, occ_no_king)
 
     # Enemy king attacks
     enemy_king_sq = Helper.lsb(get_king_bb(board, attacker_color))
     if enemy_king_sq, do: danger ||| Precomputed.get_king_attacks(enemy_king_sq), else: danger
   end
 
-  defp or_piece_attacks(danger, 0, _fun), do: danger
+  defp or_knight_attacks(danger, 0), do: danger
 
-  defp or_piece_attacks(danger, bb, fun) do
+  defp or_knight_attacks(danger, bb) do
     sq = Helper.lsb(bb)
-    or_piece_attacks(danger ||| fun.(sq), bb &&& bb - 1, fun)
+    or_knight_attacks(danger ||| Precomputed.get_knight_attacks(sq), bb &&& bb - 1)
   end
 
-  defp or_slider_attacks(danger, 0, _occ, _fun), do: danger
+  defp or_bishop_attacks(danger, 0, _occ), do: danger
 
-  defp or_slider_attacks(danger, bb, occ, fun) do
+  defp or_bishop_attacks(danger, bb, occ) do
     sq = Helper.lsb(bb)
-    or_slider_attacks(danger ||| fun.(sq, occ), bb &&& bb - 1, occ, fun)
+    or_bishop_attacks(danger ||| Magic.get_bishop_attacks(sq, occ), bb &&& bb - 1, occ)
   end
 
+  defp or_rook_attacks(danger, 0, _occ), do: danger
+
+  defp or_rook_attacks(danger, bb, occ) do
+    sq = Helper.lsb(bb)
+    or_rook_attacks(danger ||| Magic.get_rook_attacks(sq, occ), bb &&& bb - 1, occ)
+  end
+
+  # Precomputed all-ones pin mask for the common case of no pins
+  @no_pin_mask :erlang.make_tuple(64, Constants.mask64())
+
+  # Returns {pinned_bb, pin_mask_tuple} where pin_mask_tuple is a 64-element tuple.
+  # Unpinned squares have @mask64 (all-ones), pinned squares have their ray mask.
+  # This enables branchless pin checking: targets &&& elem(pin_mask, from)
   defp compute_pins(board, king_sq, turn, us_bb, them_bb) do
     opponent = Piece.opponent(turn)
 
@@ -301,27 +309,34 @@ defmodule Echecs.MoveGen do
     bishop_xray = Magic.get_bishop_attacks(king_sq, them_bb)
     diag_pinners = bishop_xray &&& enemy_bq
 
-    {pinned, pin_rays} = process_pinners(hv_pinners, king_sq, us_bb, 0, %{})
-    process_pinners(diag_pinners, king_sq, us_bb, pinned, pin_rays)
+    # Short-circuit: if no potential pinners, skip tuple allocation
+    if (hv_pinners ||| diag_pinners) == 0 do
+      {0, @no_pin_mask}
+    else
+      {pinned, pin_mask} =
+        process_pinners(hv_pinners, king_sq, us_bb, 0, @no_pin_mask)
+
+      process_pinners(diag_pinners, king_sq, us_bb, pinned, pin_mask)
+    end
   end
 
-  defp process_pinners(0, _king_sq, _us_bb, pinned, pin_rays), do: {pinned, pin_rays}
+  defp process_pinners(0, _king_sq, _us_bb, pinned, pin_mask), do: {pinned, pin_mask}
 
-  defp process_pinners(pinners, king_sq, us_bb, pinned, pin_rays) do
+  defp process_pinners(pinners, king_sq, us_bb, pinned, pin_mask) do
     pinner_sq = Helper.lsb(pinners)
     between = Precomputed.get_between(king_sq, pinner_sq)
     our_between = between &&& us_bb
 
-    {pinned, pin_rays} =
+    {pinned, pin_mask} =
       if Helper.pop_count(our_between) == 1 do
         pinned_sq = Helper.lsb(our_between)
         ray = between ||| 1 <<< pinner_sq
-        {pinned ||| our_between, Map.put(pin_rays, pinned_sq, ray)}
+        {pinned ||| our_between, put_elem(pin_mask, pinned_sq, ray)}
       else
-        {pinned, pin_rays}
+        {pinned, pin_mask}
       end
 
-    process_pinners(pinners &&& pinners - 1, king_sq, us_bb, pinned, pin_rays)
+    process_pinners(pinners &&& pinners - 1, king_sq, us_bb, pinned, pin_mask)
   end
 
   # ── Non-king move generation (with check_mask + pin restrictions) ──
@@ -342,27 +357,21 @@ defmodule Echecs.MoveGen do
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp gen_slider_moves(acc, type, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) do
+  defp gen_slider_moves(acc, type, board, turn, us_bb, all_bb, check_mask, _pinned, pin_mask) do
     bb = get_slider_bb(board, turn, type)
-    do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+    do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pin_mask)
   end
 
-  defp do_gen_sliders(0, acc, _type, _us_bb, _all_bb, _check_mask, _pinned, _pin_rays), do: acc
+  defp do_gen_sliders(0, acc, _type, _us_bb, _all_bb, _check_mask, _pin_mask), do: acc
 
-  defp do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pinned, pin_rays) do
+  defp do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pin_mask) do
     from = Helper.lsb(bb)
     attacks = get_slider_attacks(type, from, all_bb)
-    targets = attacks &&& bnot(us_bb) &&& check_mask &&& @mask64
-
-    targets =
-      if (pinned &&& 1 <<< from) != 0 do
-        targets &&& Map.get(pin_rays, from, 0)
-      else
-        targets
-      end
+    # Branchless pin mask: unpinned squares have @mask64 (no-op AND), pinned have ray
+    targets = attacks &&& bnot(us_bb) &&& check_mask &&& elem(pin_mask, from) &&& @mask64
 
     acc = bitboard_to_moves_from(targets, from, acc)
-    do_gen_sliders(bb &&& bb - 1, acc, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+    do_gen_sliders(bb &&& bb - 1, acc, type, us_bb, all_bb, check_mask, pin_mask)
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -376,7 +385,7 @@ defmodule Echecs.MoveGen do
          ep_sq,
          check_mask,
          pinned,
-         pin_rays,
+         pin_mask,
          king_sq
        ) do
     pawns = get_pawns(board, turn)
@@ -392,8 +401,7 @@ defmodule Echecs.MoveGen do
         turn,
         promo_rank,
         check_mask,
-        pinned,
-        pin_rays,
+        pin_mask,
         acc
       )
 
@@ -402,17 +410,10 @@ defmodule Echecs.MoveGen do
       shift_pawn(single_pushes &&& double_rank_mask, push_dir) &&& bnot(all_bb) &&& @mask64
 
     acc =
-      extract_legal_pawn_double_pushes(
-        double_pushes,
-        -push_dir * 2,
-        check_mask,
-        pinned,
-        pin_rays,
-        acc
-      )
+      extract_legal_pawn_double_pushes(double_pushes, -push_dir * 2, check_mask, pin_mask, acc)
 
     # ── Captures ──
-    acc = gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pinned, pin_rays, acc)
+    acc = gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pin_mask, acc)
 
     # ── En passant ──
     if ep_sq do
@@ -428,7 +429,7 @@ defmodule Echecs.MoveGen do
         all_bb,
         check_mask,
         pinned,
-        pin_rays,
+        pin_mask,
         acc
       )
     else
@@ -448,36 +449,16 @@ defmodule Echecs.MoveGen do
   defp shift_pawn(bb, -8), do: bb >>> 8
   defp shift_pawn(bb, 8), do: bb <<< 8
 
-  defp extract_legal_pawn_pushes(0, _offset, _turn, _promo_rank, _cm, _pinned, _pr, acc), do: acc
+  defp extract_legal_pawn_pushes(0, _offset, _turn, _promo_rank, _cm, _pin_mask, acc), do: acc
 
-  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-  defp extract_legal_pawn_pushes(
-         pushes,
-         offset,
-         turn,
-         promo_rank,
-         check_mask,
-         pinned,
-         pin_rays,
-         acc
-       ) do
+  defp extract_legal_pawn_pushes(pushes, offset, turn, promo_rank, check_mask, pin_mask, acc) do
     to = Helper.lsb(pushes)
     from = to + offset
     to_bit = 1 <<< to
 
     acc =
-      if (to_bit &&& check_mask) != 0 do
-        if (pinned &&& 1 <<< from) != 0 do
-          ray = Map.get(pin_rays, from, 0)
-
-          if (to_bit &&& ray) != 0 do
-            add_pawn_move(acc, from, to, turn, promo_rank)
-          else
-            acc
-          end
-        else
-          add_pawn_move(acc, from, to, turn, promo_rank)
-        end
+      if (to_bit &&& check_mask &&& elem(pin_mask, from)) != 0 do
+        add_pawn_move(acc, from, to, turn, promo_rank)
       else
         acc
       end
@@ -488,102 +469,47 @@ defmodule Echecs.MoveGen do
       turn,
       promo_rank,
       check_mask,
-      pinned,
-      pin_rays,
+      pin_mask,
       acc
     )
   end
 
-  defp extract_legal_pawn_double_pushes(0, _offset, _cm, _pinned, _pr, acc), do: acc
+  defp extract_legal_pawn_double_pushes(0, _offset, _cm, _pin_mask, acc), do: acc
 
-  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-  defp extract_legal_pawn_double_pushes(pushes, offset, check_mask, pinned, pin_rays, acc) do
+  defp extract_legal_pawn_double_pushes(pushes, offset, check_mask, pin_mask, acc) do
     to = Helper.lsb(pushes)
     from = to + offset
     to_bit = 1 <<< to
 
     acc =
-      if (to_bit &&& check_mask) != 0 do
-        if (pinned &&& 1 <<< from) != 0 do
-          ray = Map.get(pin_rays, from, 0)
-
-          if (to_bit &&& ray) != 0 do
-            [Move.pack(from, to, nil, nil) | acc]
-          else
-            acc
-          end
-        else
-          [Move.pack(from, to, nil, nil) | acc]
-        end
+      if (to_bit &&& check_mask &&& elem(pin_mask, from)) != 0 do
+        [Move.pack(from, to, nil, nil) | acc]
       else
         acc
       end
 
-    extract_legal_pawn_double_pushes(
-      pushes &&& pushes - 1,
-      offset,
-      check_mask,
-      pinned,
-      pin_rays,
-      acc
-    )
+    extract_legal_pawn_double_pushes(pushes &&& pushes - 1, offset, check_mask, pin_mask, acc)
   end
 
-  defp gen_pawn_captures(0, _turn, _them_bb, _promo_rank, _cm, _pinned, _pr, acc), do: acc
+  defp gen_pawn_captures(0, _turn, _them_bb, _promo_rank, _cm, _pin_mask, acc), do: acc
 
-  defp gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pinned, pin_rays, acc) do
+  defp gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pin_mask, acc) do
     from = Helper.lsb(pawns)
     attacks = Precomputed.get_pawn_attacks(from, turn)
-    captures = attacks &&& them_bb
+    # Apply pin mask to captures: only allow captures along pin ray
+    captures = attacks &&& them_bb &&& check_mask &&& elem(pin_mask, from)
 
-    acc = do_pawn_captures(captures, from, turn, promo_rank, check_mask, pinned, pin_rays, acc)
+    acc = do_pawn_captures(captures, from, turn, promo_rank, acc)
 
-    gen_pawn_captures(
-      pawns &&& pawns - 1,
-      turn,
-      them_bb,
-      promo_rank,
-      check_mask,
-      pinned,
-      pin_rays,
-      acc
-    )
+    gen_pawn_captures(pawns &&& pawns - 1, turn, them_bb, promo_rank, check_mask, pin_mask, acc)
   end
 
-  defp do_pawn_captures(0, _from, _turn, _promo_rank, _cm, _pinned, _pr, acc), do: acc
+  defp do_pawn_captures(0, _from, _turn, _promo_rank, acc), do: acc
 
-  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-  defp do_pawn_captures(captures, from, turn, promo_rank, check_mask, pinned, pin_rays, acc) do
+  defp do_pawn_captures(captures, from, turn, promo_rank, acc) do
     to = Helper.lsb(captures)
-    to_bit = 1 <<< to
-
-    acc =
-      if (to_bit &&& check_mask) != 0 do
-        if (pinned &&& 1 <<< from) != 0 do
-          ray = Map.get(pin_rays, from, 0)
-
-          if (to_bit &&& ray) != 0 do
-            add_pawn_move(acc, from, to, turn, promo_rank)
-          else
-            acc
-          end
-        else
-          add_pawn_move(acc, from, to, turn, promo_rank)
-        end
-      else
-        acc
-      end
-
-    do_pawn_captures(
-      captures &&& captures - 1,
-      from,
-      turn,
-      promo_rank,
-      check_mask,
-      pinned,
-      pin_rays,
-      acc
-    )
+    acc = add_pawn_move(acc, from, to, turn, promo_rank)
+    do_pawn_captures(captures &&& captures - 1, from, turn, promo_rank, acc)
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -594,12 +520,12 @@ defmodule Echecs.MoveGen do
          ep_cap_offset,
          king_sq,
          board,
-         us_bb,
-         them_bb,
+         _us_bb,
+         _them_bb,
          all_bb,
          check_mask,
-         pinned,
-         pin_rays,
+         _pinned,
+         pin_mask,
          acc
        ) do
     # Find our pawns that can capture en passant
@@ -612,33 +538,15 @@ defmodule Echecs.MoveGen do
       king_sq,
       turn,
       board,
-      us_bb,
-      them_bb,
       all_bb,
       check_mask,
-      pinned,
-      pin_rays,
+      pin_mask,
       acc
     )
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp do_gen_ep(
-         0,
-         _ep_sq,
-         _offset,
-         _king_sq,
-         _turn,
-         _board,
-         _us,
-         _them,
-         _all,
-         _cm,
-         _p,
-         _pr,
-         acc
-       ),
-       do: acc
+  defp do_gen_ep(0, _ep_sq, _offset, _king_sq, _turn, _board, _all, _cm, _pm, acc), do: acc
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
   defp do_gen_ep(
@@ -648,37 +556,26 @@ defmodule Echecs.MoveGen do
          king_sq,
          turn,
          board,
-         us_bb,
-         them_bb,
          all_bb,
          check_mask,
-         pinned,
-         pin_rays,
+         pin_mask,
          acc
        ) do
     from = Helper.lsb(attackers)
     cap_sq = ep_sq + ep_cap_offset
 
     # The captured pawn must be on check_mask OR the ep_sq itself must be on check_mask
-    # (the captured pawn is the checker in some positions)
     ep_valid =
       (1 <<< ep_sq &&& check_mask) != 0 or
         (1 <<< cap_sq &&& check_mask) != 0
 
     acc =
       if ep_valid do
-        # Check pin restriction
-        pin_ok =
-          if (pinned &&& 1 <<< from) != 0 do
-            ray = Map.get(pin_rays, from, 0)
-            (1 <<< ep_sq &&& ray) != 0
-          else
-            true
-          end
+        # Check pin restriction using pin_mask tuple
+        pin_ok = (1 <<< ep_sq &&& elem(pin_mask, from)) != 0
 
         if pin_ok do
           # Check for horizontal discovered check (the rare EP edge case)
-          # Remove both pawns from occupancy, add capturing pawn to ep_sq
           occ_after = bxor(all_bb, 1 <<< from ||| 1 <<< cap_sq) ||| 1 <<< ep_sq
           opponent = Piece.opponent(turn)
           enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
@@ -703,12 +600,9 @@ defmodule Echecs.MoveGen do
       king_sq,
       turn,
       board,
-      us_bb,
-      them_bb,
       all_bb,
       check_mask,
-      pinned,
-      pin_rays,
+      pin_mask,
       acc
     )
   end
@@ -748,15 +642,10 @@ defmodule Echecs.MoveGen do
 
   defp try_castle(acc, side, castling, king_sq, turn, all_bb, danger) do
     if Game.has_right?(castling, turn, side) do
-      {path_mask, check_sqs, target, special} = castle_params(side, turn)
+      {path_mask, check_mask, target, special} = castle_params(side, turn)
 
-      # Path must be clear (bitwise check)
-      path_clear = (all_bb &&& path_mask) == 0
-
-      # King traversal squares must not be attacked
-      path_safe = Enum.all?(check_sqs, fn sq -> (danger &&& 1 <<< sq) == 0 end)
-
-      if path_clear and path_safe do
+      # Path must be clear and traversal squares not attacked (single bitwise op each)
+      if (all_bb &&& path_mask) == 0 and (danger &&& check_mask) == 0 do
         [Move.pack(king_sq, target, nil, special) | acc]
       else
         acc
@@ -766,17 +655,19 @@ defmodule Echecs.MoveGen do
     end
   end
 
+  # {path_mask, check_mask, target_sq, special}
+  # check_mask = bitboard of squares king traverses (must not be attacked)
   defp castle_params(:kingside, :white),
-    do: {Constants.white_ks_path(), [61, 62], 62, :kingside_castle}
+    do: {Constants.white_ks_path(), 0x6000000000000000, 62, :kingside_castle}
 
   defp castle_params(:queenside, :white),
-    do: {Constants.white_qs_path(), [59, 58], 58, :queenside_castle}
+    do: {Constants.white_qs_path(), 0x0C00000000000000, 58, :queenside_castle}
 
   defp castle_params(:kingside, :black),
-    do: {Constants.black_ks_path(), [5, 6], 6, :kingside_castle}
+    do: {Constants.black_ks_path(), 0x0000000000000060, 6, :kingside_castle}
 
   defp castle_params(:queenside, :black),
-    do: {Constants.black_qs_path(), [3, 2], 2, :queenside_castle}
+    do: {Constants.black_qs_path(), 0x000000000000000C, 2, :queenside_castle}
 
   # ── has_legal_move? short-circuit helpers ──
 
@@ -790,7 +681,7 @@ defmodule Echecs.MoveGen do
          ep_sq,
          check_mask,
          pinned,
-         pin_rays,
+         pin_mask,
          king_sq,
          game,
          danger,
@@ -802,13 +693,13 @@ defmodule Echecs.MoveGen do
       any_knight_move?(knights, us_bb, check_mask) ->
         true
 
-      any_slider_move?(:bishop, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) ->
+      any_slider_move?(:bishop, board, turn, us_bb, all_bb, check_mask, pin_mask) ->
         true
 
-      any_slider_move?(:rook, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) ->
+      any_slider_move?(:rook, board, turn, us_bb, all_bb, check_mask, pin_mask) ->
         true
 
-      any_slider_move?(:queen, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) ->
+      any_slider_move?(:queen, board, turn, us_bb, all_bb, check_mask, pin_mask) ->
         true
 
       any_pawn_move?(
@@ -820,7 +711,7 @@ defmodule Echecs.MoveGen do
         ep_sq,
         check_mask,
         pinned,
-        pin_rays,
+        pin_mask,
         king_sq
       ) ->
         true
@@ -841,29 +732,21 @@ defmodule Echecs.MoveGen do
     if targets != 0, do: true, else: any_knight_move?(knights &&& knights - 1, us_bb, check_mask)
   end
 
-  defp any_slider_move?(type, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays) do
+  defp any_slider_move?(type, board, turn, us_bb, all_bb, check_mask, pin_mask) do
     bb = get_slider_bb(board, turn, type)
-    any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+    any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pin_mask)
   end
 
-  defp any_slider_move_loop?(0, _type, _us_bb, _all_bb, _cm, _pinned, _pr), do: false
+  defp any_slider_move_loop?(0, _type, _us_bb, _all_bb, _cm, _pm), do: false
 
-  defp any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pinned, pin_rays) do
+  defp any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pin_mask) do
     from = Helper.lsb(bb)
     attacks = get_slider_attacks(type, from, all_bb)
-    targets = attacks &&& bnot(us_bb) &&& check_mask &&& @mask64
-
-    targets =
-      if (pinned &&& 1 <<< from) != 0 do
-        targets &&& Map.get(pin_rays, from, 0)
-      else
-        targets
-      end
+    targets = attacks &&& bnot(us_bb) &&& check_mask &&& elem(pin_mask, from) &&& @mask64
 
     if targets != 0,
       do: true,
-      else:
-        any_slider_move_loop?(bb &&& bb - 1, type, us_bb, all_bb, check_mask, pinned, pin_rays)
+      else: any_slider_move_loop?(bb &&& bb - 1, type, us_bb, all_bb, check_mask, pin_mask)
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -876,7 +759,7 @@ defmodule Echecs.MoveGen do
          ep_sq,
          check_mask,
          pinned,
-         pin_rays,
+         pin_mask,
          king_sq
        ) do
     pawns = get_pawns(board, turn)
@@ -888,13 +771,13 @@ defmodule Echecs.MoveGen do
       shift_pawn(single_pushes &&& double_rank_mask, push_dir) &&& bnot(all_bb) &&& @mask64
 
     cond do
-      any_in_mask?(single_pushes, check_mask, pinned, pin_rays, -push_dir) ->
+      any_in_mask?(single_pushes, check_mask, pin_mask, -push_dir) ->
         true
 
-      any_in_mask?(double_pushes, check_mask, pinned, pin_rays, -push_dir * 2) ->
+      any_in_mask?(double_pushes, check_mask, pin_mask, -push_dir * 2) ->
         true
 
-      any_pawn_capture?(pawns, turn, them_bb, check_mask, pinned, pin_rays) ->
+      any_pawn_capture?(pawns, turn, them_bb, check_mask, pin_mask) ->
         true
 
       ep_sq != nil ->
@@ -910,7 +793,7 @@ defmodule Echecs.MoveGen do
             board,
             all_bb,
             pinned,
-            pin_rays,
+            pin_mask,
             check_mask
           )
 
@@ -919,46 +802,32 @@ defmodule Echecs.MoveGen do
     end
   end
 
-  defp any_in_mask?(0, _cm, _pinned, _pr, _offset), do: false
+  defp any_in_mask?(0, _cm, _pm, _offset), do: false
 
-  defp any_in_mask?(bb, check_mask, pinned, pin_rays, offset) do
+  defp any_in_mask?(bb, check_mask, pin_mask, offset) do
     to = Helper.lsb(bb)
     from = to + offset
     to_bit = 1 <<< to
 
-    ok =
-      (to_bit &&& check_mask) != 0 and
-        ((pinned &&& 1 <<< from) == 0 or (to_bit &&& Map.get(pin_rays, from, 0)) != 0)
+    ok = (to_bit &&& check_mask &&& elem(pin_mask, from)) != 0
 
-    if ok, do: true, else: any_in_mask?(bb &&& bb - 1, check_mask, pinned, pin_rays, offset)
+    if ok, do: true, else: any_in_mask?(bb &&& bb - 1, check_mask, pin_mask, offset)
   end
 
-  defp any_pawn_capture?(0, _turn, _them, _cm, _pinned, _pr), do: false
+  defp any_pawn_capture?(0, _turn, _them, _cm, _pm), do: false
 
-  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-  defp any_pawn_capture?(pawns, turn, them_bb, check_mask, pinned, pin_rays) do
+  defp any_pawn_capture?(pawns, turn, them_bb, check_mask, pin_mask) do
     from = Helper.lsb(pawns)
     attacks = Precomputed.get_pawn_attacks(from, turn)
-    captures = attacks &&& them_bb &&& check_mask
+    captures = attacks &&& them_bb &&& check_mask &&& elem(pin_mask, from)
 
-    if captures != 0 do
-      if (pinned &&& 1 <<< from) != 0 do
-        ray = Map.get(pin_rays, from, 0)
-
-        if (captures &&& ray) != 0,
-          do: true,
-          else:
-            any_pawn_capture?(pawns &&& pawns - 1, turn, them_bb, check_mask, pinned, pin_rays)
-      else
-        true
-      end
-    else
-      any_pawn_capture?(pawns &&& pawns - 1, turn, them_bb, check_mask, pinned, pin_rays)
-    end
+    if captures != 0,
+      do: true,
+      else: any_pawn_capture?(pawns &&& pawns - 1, turn, them_bb, check_mask, pin_mask)
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp ep_is_legal_any?(0, _ep_sq, _offset, _king_sq, _turn, _board, _all, _pinned, _pr, _cm),
+  defp ep_is_legal_any?(0, _ep_sq, _offset, _king_sq, _turn, _board, _all, _pinned, _pm, _cm),
     do: false
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -971,7 +840,7 @@ defmodule Echecs.MoveGen do
          board,
          all_bb,
          pinned,
-         pin_rays,
+         pin_mask,
          check_mask
        ) do
     from = Helper.lsb(attackers)
@@ -981,13 +850,7 @@ defmodule Echecs.MoveGen do
 
     ok =
       if ep_valid do
-        pin_ok =
-          if (pinned &&& 1 <<< from) != 0 do
-            ray = Map.get(pin_rays, from, 0)
-            (1 <<< ep_sq &&& ray) != 0
-          else
-            true
-          end
+        pin_ok = (1 <<< ep_sq &&& elem(pin_mask, from)) != 0
 
         if pin_ok do
           occ_after = bxor(all_bb, 1 <<< from ||| 1 <<< cap_sq) ||| 1 <<< ep_sq
@@ -1014,7 +877,7 @@ defmodule Echecs.MoveGen do
           board,
           all_bb,
           pinned,
-          pin_rays,
+          pin_mask,
           check_mask
         )
   end
@@ -1026,10 +889,8 @@ defmodule Echecs.MoveGen do
 
   defp any_castle_side?(side, castling, _king_sq, turn, all_bb, danger) do
     if Game.has_right?(castling, turn, side) do
-      {path_mask, check_sqs, _target, _special} = castle_params(side, turn)
-      path_clear = (all_bb &&& path_mask) == 0
-      path_safe = Enum.all?(check_sqs, fn sq -> (danger &&& 1 <<< sq) == 0 end)
-      path_clear and path_safe
+      {path_mask, check_mask, _target, _special} = castle_params(side, turn)
+      (all_bb &&& path_mask) == 0 and (danger &&& check_mask) == 0
     else
       false
     end

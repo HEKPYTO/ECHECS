@@ -49,7 +49,7 @@ defmodule Echecs.Game do
           fullmove: pos_integer(),
           history: [any()],
           zobrist_hash: non_neg_integer(),
-          king_pos: %{white: Board.square() | nil, black: Board.square() | nil}
+          king_pos: {Board.square() | nil, Board.square() | nil}
         }
 
   defstruct board: nil,
@@ -60,7 +60,7 @@ defmodule Echecs.Game do
             fullmove: 1,
             history: [],
             zobrist_hash: 0,
-            king_pos: %{white: 60, black: 4}
+            king_pos: {60, 4}
 
   @start_fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
@@ -72,10 +72,7 @@ defmodule Echecs.Game do
     parsed = FEN.parse(fen)
     board = ensure_tuple(parsed.board)
 
-    king_pos = %{
-      white: find_king_sq(board, :white),
-      black: find_king_sq(board, :black)
-    }
+    king_pos = {find_king_sq(board, :white), find_king_sq(board, :black)}
 
     initial_state = {board, parsed.turn, parsed.castling, parsed.en_passant}
 
@@ -146,6 +143,94 @@ defmodule Echecs.Game do
     }
   end
 
+  @doc """
+  Executes a move using a packed integer move (no struct allocation).
+  """
+  def make_move_int(%__MODULE__{} = game, packed_move) do
+    from = Move.unpack_from(packed_move)
+    to = Move.unpack_to(packed_move)
+    promotion = Move.unpack_promotion(packed_move)
+    special = Move.unpack_special(packed_move)
+
+    board = game.board
+    piece = Board.at_tuple(board, from)
+    target_piece = Board.at_tuple(board, to)
+
+    new_board = Board.make_move_on_board_tuple(board, packed_move, game.turn)
+
+    next_turn = Piece.opponent(game.turn)
+
+    castling =
+      game.castling &&& elem(@castling_masks, from) &&& elem(@castling_masks, to)
+
+    en_passant = calculate_en_passant_int(piece, from, to)
+    halfmove = update_halfmove(game.halfmove, piece, target_piece)
+    fullmove = if game.turn == :black, do: game.fullmove + 1, else: game.fullmove
+    king_pos = update_king_pos(game.king_pos, piece, to, game.turn)
+
+    new_hash =
+      Echecs.Zobrist.update_hash_int(
+        game.zobrist_hash,
+        from,
+        to,
+        promotion,
+        special,
+        piece,
+        target_piece,
+        {game.castling, castling},
+        {game.en_passant, en_passant},
+        game.turn
+      )
+
+    %__MODULE__{
+      game
+      | board: new_board,
+        turn: next_turn,
+        castling: castling,
+        en_passant: en_passant,
+        halfmove: halfmove,
+        fullmove: fullmove,
+        history: [game.zobrist_hash | game.history],
+        zobrist_hash: new_hash,
+        king_pos: king_pos
+    }
+  end
+
+  @doc """
+  Stripped-down make_move for perft: skips Zobrist hash, history, halfmove/fullmove.
+  Only updates board, turn, castling, en_passant, king_pos.
+  """
+  def make_move_perft(%__MODULE__{} = game, packed_move) do
+    from = Move.unpack_from(packed_move)
+    to = Move.unpack_to(packed_move)
+
+    board = game.board
+    piece = Board.at_tuple(board, from)
+
+    new_board = Board.make_move_on_board_tuple(board, packed_move, game.turn)
+
+    castling =
+      game.castling &&& elem(@castling_masks, from) &&& elem(@castling_masks, to)
+
+    en_passant = calculate_en_passant_int(piece, from, to)
+    king_pos = update_king_pos(game.king_pos, piece, to, game.turn)
+
+    %__MODULE__{
+      game
+      | board: new_board,
+        turn: Piece.opponent(game.turn),
+        castling: castling,
+        en_passant: en_passant,
+        king_pos: king_pos
+    }
+  end
+
+  defp calculate_en_passant_int({_, :pawn}, from, to) when abs(from - to) == 16 do
+    div(from + to, 2)
+  end
+
+  defp calculate_en_passant_int(_, _, _), do: nil
+
   defp calculate_en_passant({_, :pawn}, %Move{from: from, to: to}) when abs(from - to) == 16 do
     div(from + to, 2)
   end
@@ -156,10 +241,12 @@ defmodule Echecs.Game do
   defp update_halfmove(_, _, target) when not is_nil(target), do: 0
   defp update_halfmove(current, _, _), do: current + 1
 
-  defp update_king_pos(king_pos, {_, :king}, to, turn) do
-    Map.put(king_pos, turn, to)
-  end
+  @compile {:inline, king_sq_for: 2}
+  defp king_sq_for(king_pos, :white), do: elem(king_pos, 0)
+  defp king_sq_for(king_pos, :black), do: elem(king_pos, 1)
 
+  defp update_king_pos(king_pos, {_, :king}, to, :white), do: put_elem(king_pos, 0, to)
+  defp update_king_pos(king_pos, {_, :king}, to, :black), do: put_elem(king_pos, 1, to)
   defp update_king_pos(king_pos, _, _, _), do: king_pos
 
   @doc """
@@ -172,10 +259,10 @@ defmodule Echecs.Game do
 
     mover_color = game.turn
 
-    king_pos = next_game.king_pos[mover_color]
+    king_sq = king_sq_for(next_game.king_pos, mover_color)
 
-    if king_pos do
-      not attacked?(next_game, king_pos, Piece.opponent(mover_color))
+    if king_sq do
+      not attacked?(next_game, king_sq, Piece.opponent(mover_color))
     else
       false
     end
@@ -185,8 +272,8 @@ defmodule Echecs.Game do
   Returns true if the current side to move is in check.
   """
   def in_check?(game) do
-    king_pos = game.king_pos[game.turn] || find_king_sq(game.board, game.turn)
-    attacked?(game, king_pos, Piece.opponent(game.turn))
+    king_sq = king_sq_for(game.king_pos, game.turn) || find_king_sq(game.board, game.turn)
+    attacked?(game, king_sq, Piece.opponent(game.turn))
   end
 
   def attacked?(game, sq, attacker_color) do
