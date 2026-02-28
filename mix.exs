@@ -7,8 +7,21 @@ defmodule Echecs.MixProject do
       version: "0.1.3",
       elixir: "~> 1.16",
       start_permanent: Mix.env() == :prod,
+      description:
+        "A high-performance chess library in pure Elixir with bitboard move generation.",
+      package: package(),
       deps: deps(),
-      docs: docs()
+      docs: docs(),
+      name: "Echecs",
+      source_url: "https://github.com/HEKPYTO/ECHECS"
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["GPL-3.0-or-later"],
+      links: %{"GitHub" => "https://github.com/HEKPYTO/ECHECS"},
+      files: ~w(lib mix.exs README.md LICENSE)
     ]
   end
 
