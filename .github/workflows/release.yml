@@ -19,8 +19,8 @@ jobs:
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: '1.16'
-          otp-version: '26'
+          elixir-version: '1.19.5'
+          otp-version: '28'
           
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -32,11 +32,11 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
         
+      - name: Generate Magic Cache
+        run: elixir scripts/generate_magic_cache.exs
+
       - name: Compile
         run: mix compile --warnings-as-errors
-        
-      - name: Generate Magic Cache
-        run: mix run -e "Echecs.Bitboard.Magic.init()"
         
       - name: Run Core Tests
         run: mix test
