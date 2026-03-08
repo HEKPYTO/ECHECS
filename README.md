@@ -37,36 +37,30 @@ end
 ### Basic Game Loop
 
 ```elixir
-# Start a new game
 game = Echecs.new_game()
 
-# Generate legal moves
 moves = Echecs.legal_moves(game)
-# => [%Echecs.Move{from: 12, to: 28, ...}, ...]
 
-# Make a move (e2 to e4)
-# Squares are 0-indexed (a1=0 ... h8=63)
-{:ok, game} = Echecs.make_move(game, 12, 28)
+from = Echecs.Board.to_index("e2")
+to = Echecs.Board.to_index("e4")
+{:ok, game} = Echecs.make_move(game, from, to)
 
-# Check game status
 Echecs.status(game)
-# => :active (or :checkmate, :stalemate, :draw)
 ```
+
+Squares are 0-indexed from `a8 = 0` through `h1 = 63`.
 
 ### FEN Manipulation
 
 ```elixir
-# Load specific position
 game = Echecs.new_game("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2")
 
-# Export to FEN
 Echecs.FEN.to_string(game)
 ```
 
 ### PGN Parsing
 
 ```elixir
-# Parse and replay a PGN game
 pgn = "1. e4 e5 2. Nf3 Nc6 3. Bb5"
 moves = Echecs.PGN.parse_moves(pgn)
 final_game = Echecs.PGN.replay(Echecs.new_game(), moves)
@@ -84,7 +78,7 @@ The board is represented internally as a Tuple of integers (Bitboards) for maxim
 
 ## Testing & Benchmarks
 
-The engine is verified against millions of real-world games from the Lichess database to ensure correctness and stability.
+The engine is verified against large-scale replay validation from the Lichess database to ensure correctness and stability.
 
 ### Run Unit Tests
 ```bash
@@ -92,12 +86,20 @@ mix test
 ```
 
 ### Run Integration Benchmark
-To verify performance on your machine:
-1.  Download a [Lichess Database](https://database.lichess.org/) file (e.g., `lichess_db_standard_rated_2015-01.pgn.zst`).
-2.  Run the integration test:
+To verify large-scale replay correctness on your machine:
 
 ```bash
 LICHESS_DB_PATH=path/to/file.pgn.zst mix test --include integration test/integration/lichess_db_test.exs
+```
+
+### Run Engine Benchmarks
+```bash
+mix echecs.benchmark
+```
+
+### Regenerate the Magic Cache
+```bash
+elixir scripts/generate_magic_cache.exs
 ```
 
 ## Docker Support
@@ -105,10 +107,8 @@ LICHESS_DB_PATH=path/to/file.pgn.zst mix test --include integration test/integra
 Deploy or test in a consistent environment using the provided Docker image. The image automatically pre-generates the magic bitboard cache for faster startup.
 
 ```bash
-# Build
 docker build -t echecs .
 
-# Run Interactive Shell
 docker run -it --rm echecs
 iex> Echecs.new_game()
 ```

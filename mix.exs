@@ -6,6 +6,7 @@ defmodule Echecs.MixProject do
       app: :echecs,
       version: "0.1.3",
       elixir: "~> 1.16",
+      elixirc_options: [warnings_as_errors: true],
       start_permanent: Mix.env() == :prod,
       description:
         "A high-performance chess library in pure Elixir with bitboard move generation.",
@@ -21,7 +22,7 @@ defmodule Echecs.MixProject do
     [
       licenses: ["GPL-3.0-or-later"],
       links: %{"GitHub" => "https://github.com/HEKPYTO/ECHECS"},
-      files: ~w(lib mix.exs README.md LICENSE)
+      files: ~w(lib scripts mix.exs README.md LICENSE)
     ]
   end
 
@@ -32,7 +33,6 @@ defmodule Echecs.MixProject do
     ]
   end
 
-  # Run "mix help compile.app" to learn about applications.
   def application do
     [
       extra_applications: [:logger],
@@ -40,7 +40,6 @@ defmodule Echecs.MixProject do
     ]
   end
 
-  # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},

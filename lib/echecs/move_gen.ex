@@ -42,8 +42,10 @@ defmodule Echecs.MoveGen do
   Returns all legal moves as packed integers (no struct allocation).
   """
   def legal_moves_int(%Game{} = game) do
-    board = ensure_tuple(game.board)
-    turn = game.turn
+    legal_moves_int(ensure_tuple(game.board), game.turn, game.castling, game.en_passant)
+  end
+
+  def legal_moves_int(board, turn, castling, en_passant) do
     opponent = Piece.opponent(turn)
 
     {us_bb, them_bb, all_bb} = get_occupancies(board, turn)
@@ -82,7 +84,7 @@ defmodule Echecs.MoveGen do
         us_bb,
         them_bb,
         all_bb,
-        game.en_passant,
+        en_passant,
         check_mask,
         pinned,
         pin_rays,
@@ -92,7 +94,7 @@ defmodule Echecs.MoveGen do
       |> gen_slider_moves(:bishop, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
       |> gen_slider_moves(:rook, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
       |> gen_slider_moves(:queen, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
-      |> gen_castling(king_sq, turn, game, all_bb, danger, num_checkers)
+      |> gen_castling(king_sq, turn, castling, all_bb, danger, num_checkers)
     end
   end
 
@@ -100,8 +102,10 @@ defmodule Echecs.MoveGen do
   Returns true if there is at least one legal move. Short-circuits on first found.
   """
   def has_legal_move?(%Game{} = game) do
-    board = ensure_tuple(game.board)
-    turn = game.turn
+    has_legal_move?(ensure_tuple(game.board), game.turn, game.castling, game.en_passant)
+  end
+
+  def has_legal_move?(board, turn, castling, en_passant) do
     opponent = Piece.opponent(turn)
 
     {us_bb, them_bb, all_bb} = get_occupancies(board, turn)
@@ -129,15 +133,15 @@ defmodule Echecs.MoveGen do
         has_non_king_move?(
           board,
           turn,
+          castling,
           us_bb,
           them_bb,
           all_bb,
-          game.en_passant,
+          en_passant,
           check_mask,
           pinned,
           pin_rays,
           king_sq,
-          game,
           danger,
           num_checkers
         )
@@ -628,13 +632,11 @@ defmodule Echecs.MoveGen do
 
   # ── Castling ──
 
-  defp gen_castling(acc, _king_sq, _turn, _game, _all_bb, _danger, num_checkers)
+  defp gen_castling(acc, _king_sq, _turn, _castling, _all_bb, _danger, num_checkers)
        when num_checkers > 0,
        do: acc
 
-  defp gen_castling(acc, king_sq, turn, game, all_bb, danger, 0) do
-    castling = game.castling
-
+  defp gen_castling(acc, king_sq, turn, castling, all_bb, danger, 0) do
     acc
     |> try_castle(:kingside, castling, king_sq, turn, all_bb, danger)
     |> try_castle(:queenside, castling, king_sq, turn, all_bb, danger)
@@ -675,6 +677,7 @@ defmodule Echecs.MoveGen do
   defp has_non_king_move?(
          board,
          turn,
+         castling,
          us_bb,
          them_bb,
          all_bb,
@@ -683,7 +686,6 @@ defmodule Echecs.MoveGen do
          pinned,
          pin_mask,
          king_sq,
-         game,
          danger,
          num_checkers
        ) do
@@ -717,7 +719,7 @@ defmodule Echecs.MoveGen do
         true
 
       num_checkers == 0 ->
-        any_castle_int?(game.castling, Helper.lsb(get_king_bb(board, turn)), turn, all_bb, danger)
+        any_castle_int?(castling, Helper.lsb(get_king_bb(board, turn)), turn, all_bb, danger)
 
       true ->
         false
@@ -1139,22 +1141,23 @@ defmodule Echecs.MoveGen do
     if king_bb == 0 do
       acc
     else
+      board = ensure_tuple(game.board)
       king_sq = Helper.lsb(king_bb)
       castling = game.castling
       opponent = Piece.opponent(turn)
 
-      if Game.in_check?(game) do
+      if Board.attacked?(board, king_sq, opponent) do
         acc
       else
         acc
-        |> check_castling_pseudo(:kingside, castling, king_sq, turn, game, opponent)
-        |> check_castling_pseudo(:queenside, castling, king_sq, turn, game, opponent)
+        |> check_castling_pseudo(:kingside, castling, king_sq, turn, board, opponent)
+        |> check_castling_pseudo(:queenside, castling, king_sq, turn, board, opponent)
       end
     end
   end
 
-  defp check_castling_pseudo(acc, side, castling, king_sq, turn, game, opponent) do
-    if Game.has_right?(castling, turn, side) and can_castle_pseudo?(side, turn, game, opponent) do
+  defp check_castling_pseudo(acc, side, castling, king_sq, turn, board, opponent) do
+    if Game.has_right?(castling, turn, side) and can_castle_pseudo?(side, turn, board, opponent) do
       target = if side == :kingside, do: king_sq + 2, else: king_sq - 2
       special = if side == :kingside, do: :kingside_castle, else: :queenside_castle
       [Move.pack(king_sq, target, nil, special) | acc]
@@ -1163,32 +1166,24 @@ defmodule Echecs.MoveGen do
     end
   end
 
-  defp can_castle_pseudo?(:kingside, :white, game, opponent) do
-    board_tuple = ensure_tuple(game.board)
-
-    (Board.all_occ(board_tuple) &&& Constants.white_ks_path()) == 0 and
-      not Game.attacked?(game, 61, opponent) and not Game.attacked?(game, 62, opponent)
+  defp can_castle_pseudo?(:kingside, :white, board, opponent) do
+    (Board.all_occ(board) &&& Constants.white_ks_path()) == 0 and
+      not Board.attacked?(board, 61, opponent) and not Board.attacked?(board, 62, opponent)
   end
 
-  defp can_castle_pseudo?(:queenside, :white, game, opponent) do
-    board_tuple = ensure_tuple(game.board)
-
-    (Board.all_occ(board_tuple) &&& Constants.white_qs_path()) == 0 and
-      not Game.attacked?(game, 59, opponent) and not Game.attacked?(game, 58, opponent)
+  defp can_castle_pseudo?(:queenside, :white, board, opponent) do
+    (Board.all_occ(board) &&& Constants.white_qs_path()) == 0 and
+      not Board.attacked?(board, 59, opponent) and not Board.attacked?(board, 58, opponent)
   end
 
-  defp can_castle_pseudo?(:kingside, :black, game, opponent) do
-    board_tuple = ensure_tuple(game.board)
-
-    (Board.all_occ(board_tuple) &&& Constants.black_ks_path()) == 0 and
-      not Game.attacked?(game, 5, opponent) and not Game.attacked?(game, 6, opponent)
+  defp can_castle_pseudo?(:kingside, :black, board, opponent) do
+    (Board.all_occ(board) &&& Constants.black_ks_path()) == 0 and
+      not Board.attacked?(board, 5, opponent) and not Board.attacked?(board, 6, opponent)
   end
 
-  defp can_castle_pseudo?(:queenside, :black, game, opponent) do
-    board_tuple = ensure_tuple(game.board)
-
-    (Board.all_occ(board_tuple) &&& Constants.black_qs_path()) == 0 and
-      not Game.attacked?(game, 3, opponent) and not Game.attacked?(game, 2, opponent)
+  defp can_castle_pseudo?(:queenside, :black, board, opponent) do
+    (Board.all_occ(board) &&& Constants.black_qs_path()) == 0 and
+      not Board.attacked?(board, 3, opponent) and not Board.attacked?(board, 2, opponent)
   end
 
   # ── Reverse pawn moves (for generate_moves_targeting) ──

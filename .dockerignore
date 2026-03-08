@@ -2,6 +2,7 @@
 _build/
 deps/
 doc/
+priv/
 *.ez
 .DS_Store
 
