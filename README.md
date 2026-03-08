@@ -1,25 +1,31 @@
 # Echecs
 
-**A high-performance Chess Engine implemented in pure Elixir.**
+**A pure Elixir chess library focused on rule correctness and practical performance.**
 
 [![CI](https://github.com/HEKPYTO/ECHECS/actions/workflows/ci.yml/badge.svg)](https://github.com/HEKPYTO/ECHECS/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/echecs.svg)](https://hex.pm/packages/echecs)
 
-Echecs is a robust chess library designed for speed and correctness. It leverages advanced optimization techniques available on the BEAM virtual machine (Bitboards, Magic Bitboards, Integer packing, etc), making it suitable for high-throughput analysis and scalable applications.
+Echecs is a chess library implemented entirely in Elixir. It aims to keep the public API straightforward while using a faster internal representation for move generation, legality checks, and perft-style traversal.
+
+Internally, the engine uses bitboards, packed integer moves, precomputed attack tables, and a tuple-based board representation. Those choices keep the hot path compact on the BEAM without relying on NIFs or external native code.
 
 ## Features
 
-*   **High Performance**: Process over **4,000 games per second** (benchmarked on M1 Pro).
-*   **Pure Elixir**: No NIFs or external dependencies (C/Rust) required for core logic.
-*   **Advanced Engine Architecture**:
-    *   **Bitboards**: 64-bit integer representation for O(1) board operations.
-    *   **Magic Bitboards**: Fast sliding piece attack generation.
-    *   **Integer Move Encoding**: Zero-allocation move generation using packed 20-bit integers to minimize Garbage Collection.
-    *   **Zobrist Hashing**: Efficient game state hashing for repetition detection.
-*   **Standard Compliance**:
-    *   **FEN**: Full Forsyth-Edwards Notation parsing and generation.
-    *   **PGN**: Parsing and replay support for standard chess games.
-*   **Complete Rule Implementation**: Castling, En Passant, Promotion, 50-move rule, and 3-fold repetition.
+*   **Pure Elixir**: core move generation and rule handling stay in Elixir.
+*   **Bitboard-based engine**: board state is tracked with 64-bit piece sets and precomputed attack tables.
+*   **Packed move format**: internal move generation uses integers to reduce allocation in tight loops.
+*   **Standard chess support**: legal move generation, FEN, PGN replay, castling, en passant, promotion, repetition, and the 50-move rule.
+*   **Benchmarkable internals**: the repository includes perft and move generation benchmarks for regression tracking.
+
+## How It Works
+
+The public interface centers on `%Echecs.Game{}`. That struct keeps the information needed for normal application use such as turn, castling rights, en passant state, clocks, and game history.
+
+For engine work, the board is converted into an internal tuple of bitboards. Move generation operates on that tuple representation and uses precomputed attack data for kings, knights, pawns, and magic-bitboard lookups for sliding pieces.
+
+Moves are represented internally as packed integers. That allows legality checks and perft traversal to stay on a lightweight path before moves are converted back into structs for the higher-level API.
+
+Repetition detection and state transitions use Zobrist hashing so positions can be tracked efficiently without comparing full board states on every move.
 
 ## Installation
 
@@ -71,11 +77,11 @@ final_game = Echecs.PGN.replay(Echecs.new_game(), moves)
 
 ### Performance Considerations
 
-Echecs is designed to be extremely memory-efficient. The `Echecs.MoveGen.legal_moves_int/1` function returns moves as packed integers instead of structs, which is ideal for tight loops or search algorithms (e.g. Minimax) where struct allocation overhead is significant.
+`Echecs.MoveGen.legal_moves_int/1` returns packed integer moves instead of structs. That is the lower-level API used by the faster internal paths and is useful when you need to iterate over many positions without extra allocation.
 
 ### Internal Board Representation
 
-The board is represented internally as a Tuple of integers (Bitboards) for maximum access speed on the BEAM. This allows the engine to query piece locations and attack maps in constant time.
+The board is represented internally as a tuple of bitboards. This keeps access and updates inexpensive on the BEAM and matches the data layout used by the move generator and perft code.
 
 ## Testing & Benchmarks
 
