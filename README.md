@@ -3,6 +3,7 @@
 **A high-performance Chess Engine implemented in pure Elixir.**
 
 [![CI](https://github.com/HEKPYTO/ECHECS/actions/workflows/ci.yml/badge.svg)](https://github.com/HEKPYTO/ECHECS/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/echecs.svg)](https://hex.pm/packages/echecs)
 
 Echecs is a robust chess library designed for speed and correctness. It leverages advanced optimization techniques available on the BEAM virtual machine (Bitboards, Magic Bitboards, Integer packing, etc), making it suitable for high-throughput analysis and scalable applications.
 
