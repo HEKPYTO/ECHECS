@@ -14,8 +14,9 @@ RUN mix deps.get --only prod
 RUN mix deps.compile
 
 COPY lib lib
+COPY scripts scripts
+RUN elixir scripts/generate_magic_cache.exs
 RUN mix compile
-RUN mix run -e "Echecs.Bitboard.Magic.init()"
 
 FROM elixir:alpine AS runner
 
@@ -29,16 +30,9 @@ RUN addgroup -g 1000 echecs && \
 
 USER echecs
 
-RUN mix local.hex --force && \
-    mix local.rebar --force
-
-ENV MIX_ENV=prod
+ENV MIX_ENV=prod \
+    ERL_LIBS=/app/_build/prod/lib
 
 COPY --from=builder --chown=echecs:echecs /app/_build/prod/lib ./_build/prod/lib
-COPY --from=builder --chown=echecs:echecs /app/deps ./deps
-COPY --from=builder --chown=echecs:echecs /app/mix.exs .
-COPY --from=builder --chown=echecs:echecs /app/mix.lock .
-COPY --from=builder --chown=echecs:echecs /app/lib ./lib
-COPY --from=builder --chown=echecs:echecs /app/priv ./priv
 
-CMD ["iex", "-S", "mix", "run", "--no-start"]
+CMD ["iex"]

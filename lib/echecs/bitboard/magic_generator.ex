@@ -23,6 +23,15 @@ defmodule Echecs.Bitboard.MagicGenerator do
     %{rook: rooks, bishop: bishops}
   end
 
+  @doc """
+  Finds magic numbers for all squares without spawning worker tasks.
+  """
+  def find_all_magics_serial do
+    rooks = Enum.map(0..63, &find_magic(&1, :rook))
+    bishops = Enum.map(0..63, &find_magic(&1, :bishop))
+    %{rook: rooks, bishop: bishops}
+  end
+
   def find_magic(sq, piece_type) do
     mask = if piece_type == :rook, do: mask_rook(sq), else: mask_bishop(sq)
     bits = Helper.pop_count(mask)

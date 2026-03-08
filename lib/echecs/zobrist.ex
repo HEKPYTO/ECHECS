@@ -1,59 +1,46 @@
 defmodule Echecs.Zobrist do
   @moduledoc """
   Zobrist Hashing implementation for fast state repetition detection.
-  Optimized using Tuple-based lookups for O(1) access.
+  Optimized using Tuple-based lookups for O(1) access, fully computed at compile time.
   """
   import Bitwise
 
-  @key :zobrist_keys
-  @castling_hashes_key :zobrist_castling_hashes
+  # Compile-time initialization of Zobrist keys
+  :rand.seed(:exsss, {1, 2, 3})
 
-  def init do
-    :rand.seed(:exsss, {1, 2, 3})
+  piece_keys =
+    for _color <- [:white, :black],
+        _type <- [:pawn, :knight, :bishop, :rook, :queen, :king],
+        _sq <- 0..63 do
+      :rand.uniform(0xFFFFFFFFFFFFFFFF)
+    end
 
-    piece_keys =
-      for _color <- [:white, :black],
-          _type <- [:pawn, :knight, :bishop, :rook, :queen, :king],
-          _sq <- 0..63 do
-        rand64()
-      end
-
-    castling_keys = [rand64(), rand64(), rand64(), rand64()]
-
-    ep_keys = for _f <- 0..7, do: rand64()
-
-    side_key = [rand64()]
-
-    all_keys = piece_keys ++ castling_keys ++ ep_keys ++ side_key
-    tuple_keys = List.to_tuple(all_keys)
-
-    :persistent_term.put(@key, tuple_keys)
-
-    # Precompute combined castling hashes for all 16 states
-    castling_hashes =
-      for state <- 0..15 do
-        compute_castling_hash(state, castling_keys)
-      end
-      |> List.to_tuple()
-
-    :persistent_term.put(@castling_hashes_key, castling_hashes)
-
-    :ok
-  end
-
-  defp compute_castling_hash(state, castling_keys) do
-    Enum.reduce(0..3, 0, fn bit, acc ->
-      if (state &&& 1 <<< bit) != 0 do
-        bxor(acc, Enum.at(castling_keys, bit))
-      else
-        acc
-      end
-    end)
-  end
-
-  defp rand64 do
+  castling_keys = [
+    :rand.uniform(0xFFFFFFFFFFFFFFFF),
+    :rand.uniform(0xFFFFFFFFFFFFFFFF),
+    :rand.uniform(0xFFFFFFFFFFFFFFFF),
     :rand.uniform(0xFFFFFFFFFFFFFFFF)
-  end
+  ]
+
+  ep_keys = for _f <- 0..7, do: :rand.uniform(0xFFFFFFFFFFFFFFFF)
+
+  side_key = [:rand.uniform(0xFFFFFFFFFFFFFFFF)]
+
+  all_keys = piece_keys ++ castling_keys ++ ep_keys ++ side_key
+  @keys List.to_tuple(all_keys)
+
+  @castling_hashes (for state <- 0..15 do
+                      Enum.reduce(0..3, 0, fn bit, acc ->
+                        if (state &&& 1 <<< bit) != 0 do
+                          bxor(acc, Enum.at(castling_keys, bit))
+                        else
+                          acc
+                        end
+                      end)
+                    end)
+                   |> List.to_tuple()
+
+  def init, do: :ok
 
   @compile {:inline, piece_index: 3, ep_index: 1, side_index: 0, color_to_int: 1, type_to_int: 1}
 
@@ -76,8 +63,6 @@ defmodule Echecs.Zobrist do
   defp side_index, do: 780
 
   def hash(board, turn, castling, en_passant) do
-    keys = :persistent_term.get(@key)
-
     h =
       0..63
       |> Enum.reduce(0, fn sq, acc ->
@@ -87,24 +72,23 @@ defmodule Echecs.Zobrist do
 
           {c, t} ->
             idx = piece_index(c, t, sq)
-            bxor(acc, elem(keys, idx))
+            bxor(acc, elem(@keys, idx))
         end
       end)
 
     # XOR castling hash using precomputed table
-    castling_hashes = :persistent_term.get(@castling_hashes_key)
-    h = bxor(h, elem(castling_hashes, castling))
+    h = bxor(h, elem(@castling_hashes, castling))
 
     h =
       if en_passant do
         file = rem(en_passant, 8)
-        bxor(h, elem(keys, ep_index(file)))
+        bxor(h, elem(@keys, ep_index(file)))
       else
         h
       end
 
     if turn == :black do
-      bxor(h, elem(keys, side_index()))
+      bxor(h, elem(@keys, side_index()))
     else
       h
     end
@@ -121,14 +105,12 @@ defmodule Echecs.Zobrist do
         {old_ep, new_ep},
         turn
       ) do
-    keys = :persistent_term.get(@key)
-
     current_hash
-    |> bxor(elem(keys, side_index()))
-    |> update_ep(old_ep, new_ep, keys)
+    |> bxor(elem(@keys, side_index()))
+    |> update_ep(old_ep, new_ep)
     |> update_castling_hash(old_castling, new_castling)
-    |> update_pieces(move, piece, target_piece, keys)
-    |> update_special_moves(move, piece, turn, keys)
+    |> update_pieces(move, piece, target_piece)
+    |> update_special_moves(move, piece, turn)
   end
 
   @doc """
@@ -147,107 +129,104 @@ defmodule Echecs.Zobrist do
         {old_ep, new_ep},
         turn
       ) do
-    keys = :persistent_term.get(@key)
-
     current_hash
-    |> bxor(elem(keys, side_index()))
-    |> update_ep(old_ep, new_ep, keys)
+    |> bxor(elem(@keys, side_index()))
+    |> update_ep(old_ep, new_ep)
     |> update_castling_hash(old_castling, new_castling)
-    |> update_pieces_int(from, to, promotion, piece, target_piece, keys)
-    |> update_special_moves_int(special, to, piece, turn, keys)
+    |> update_pieces_int(from, to, promotion, piece, target_piece)
+    |> update_special_moves_int(special, to, piece, turn)
   end
 
-  defp update_ep(h, old_ep, new_ep, keys) do
-    h = if old_ep, do: bxor(h, elem(keys, ep_index(rem(old_ep, 8)))), else: h
-    if new_ep, do: bxor(h, elem(keys, ep_index(rem(new_ep, 8)))), else: h
+  defp update_ep(h, old_ep, new_ep) do
+    h = if old_ep, do: bxor(h, elem(@keys, ep_index(rem(old_ep, 8)))), else: h
+    if new_ep, do: bxor(h, elem(@keys, ep_index(rem(new_ep, 8)))), else: h
   end
 
   defp update_castling_hash(h, old_castling, new_castling) do
     changed = bxor(old_castling, new_castling)
 
     if changed != 0 do
-      castling_hashes = :persistent_term.get(@castling_hashes_key)
-      bxor(h, elem(castling_hashes, changed))
+      bxor(h, elem(@castling_hashes, changed))
     else
       h
     end
   end
 
-  defp update_pieces(h, move, {c, t}, target_piece, keys) do
+  defp update_pieces(h, move, {c, t}, target_piece) do
     from = move.from
     to = move.to
     promotion = move.promotion
 
     idx_from = piece_index(c, t, from)
-    h = bxor(h, elem(keys, idx_from))
+    h = bxor(h, elem(@keys, idx_from))
 
     final_type = promotion || t
     idx_to = piece_index(c, final_type, to)
-    h = bxor(h, elem(keys, idx_to))
+    h = bxor(h, elem(@keys, idx_to))
 
     if target_piece do
       {tc, tt} = target_piece
       idx_target = piece_index(tc, tt, to)
-      bxor(h, elem(keys, idx_target))
+      bxor(h, elem(@keys, idx_target))
     else
       h
     end
   end
 
-  defp update_pieces_int(h, from, to, promotion, {c, t}, target_piece, keys) do
+  defp update_pieces_int(h, from, to, promotion, {c, t}, target_piece) do
     idx_from = piece_index(c, t, from)
-    h = bxor(h, elem(keys, idx_from))
+    h = bxor(h, elem(@keys, idx_from))
 
     final_type = promotion || t
     idx_to = piece_index(c, final_type, to)
-    h = bxor(h, elem(keys, idx_to))
+    h = bxor(h, elem(@keys, idx_to))
 
     if target_piece do
       {tc, tt} = target_piece
       idx_target = piece_index(tc, tt, to)
-      bxor(h, elem(keys, idx_target))
+      bxor(h, elem(@keys, idx_target))
     else
       h
     end
   end
 
-  defp update_special_moves(h, move, {c, _}, turn, keys) do
+  defp update_special_moves(h, move, {c, _}, turn) do
     cond do
       move.special == :en_passant ->
         cap_sq = if turn == :white, do: move.to + 8, else: move.to - 8
         op_c = if c == :white, do: :black, else: :white
         idx = piece_index(op_c, :pawn, cap_sq)
-        bxor(h, elem(keys, idx))
+        bxor(h, elem(@keys, idx))
 
       move.special == :kingside_castle ->
-        update_castle_rooks(h, c, :kingside, keys)
+        update_castle_rooks(h, c, :kingside)
 
       move.special == :queenside_castle ->
-        update_castle_rooks(h, c, :queenside, keys)
+        update_castle_rooks(h, c, :queenside)
 
       true ->
         h
     end
   end
 
-  defp update_special_moves_int(h, :en_passant, to, {c, _}, turn, keys) do
+  defp update_special_moves_int(h, :en_passant, to, {c, _}, turn) do
     cap_sq = if turn == :white, do: to + 8, else: to - 8
     op_c = if c == :white, do: :black, else: :white
     idx = piece_index(op_c, :pawn, cap_sq)
-    bxor(h, elem(keys, idx))
+    bxor(h, elem(@keys, idx))
   end
 
-  defp update_special_moves_int(h, :kingside_castle, _to, {c, _}, _turn, keys) do
-    update_castle_rooks(h, c, :kingside, keys)
+  defp update_special_moves_int(h, :kingside_castle, _to, {c, _}, _turn) do
+    update_castle_rooks(h, c, :kingside)
   end
 
-  defp update_special_moves_int(h, :queenside_castle, _to, {c, _}, _turn, keys) do
-    update_castle_rooks(h, c, :queenside, keys)
+  defp update_special_moves_int(h, :queenside_castle, _to, {c, _}, _turn) do
+    update_castle_rooks(h, c, :queenside)
   end
 
-  defp update_special_moves_int(h, _, _to, _piece, _turn, _keys), do: h
+  defp update_special_moves_int(h, _, _to, _piece, _turn), do: h
 
-  defp update_castle_rooks(h, c, side, keys) do
+  defp update_castle_rooks(h, c, side) do
     {r_from, r_to} =
       case {c, side} do
         {:white, :kingside} -> {63, 61}
@@ -260,7 +239,7 @@ defmodule Echecs.Zobrist do
     idx_to = piece_index(c, :rook, r_to)
 
     h
-    |> bxor(elem(keys, idx_from))
-    |> bxor(elem(keys, idx_to))
+    |> bxor(elem(@keys, idx_from))
+    |> bxor(elem(@keys, idx_to))
   end
 end

@@ -1,11 +1,15 @@
 defmodule Echecs.ApiTest do
   use ExUnit.Case
-  alias Echecs.{Board, Game, MoveGen}
+  alias Echecs.{Board, Game, MoveGen, Zobrist}
 
   test "starts a new game" do
     game = Echecs.new_game()
     assert game.turn == :white
     assert Echecs.status(game) == :active
+    assert game.history == [game.zobrist_hash]
+
+    assert game.zobrist_hash ==
+             Zobrist.hash(game.board, game.turn, game.castling, game.en_passant)
   end
 
   test "makes a legal move" do
@@ -163,5 +167,15 @@ defmodule Echecs.ApiTest do
 
     assert Echecs.status(final_game) == :draw
     assert Game.draw?(final_game)
+  end
+
+  test "repetition-sensitive state includes castling rights and en passant" do
+    with_castling = Echecs.new_game("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+    without_castling = Echecs.new_game("r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1")
+    with_ep = Echecs.new_game("8/8/8/8/3pP3/8/8/8 b - e3 0 1")
+    without_ep = Echecs.new_game("8/8/8/8/3pP3/8/8/8 b - - 0 1")
+
+    refute with_castling.zobrist_hash == without_castling.zobrist_hash
+    refute with_ep.zobrist_hash == without_ep.zobrist_hash
   end
 end

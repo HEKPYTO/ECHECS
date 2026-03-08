@@ -3,18 +3,8 @@ defmodule Echecs.Application do
 
   use Application
 
-  alias Echecs.Bitboard.{Magic, Precomputed}
-  alias Echecs.Zobrist
-
   @impl true
   def start(_type, _args) do
-    Magic.init()
-    Precomputed.init()
-    Zobrist.init()
-
-    children = []
-
-    opts = [strategy: :one_for_one, name: Echecs.Supervisor]
-    Supervisor.start_link(children, opts)
+    Supervisor.start_link([], strategy: :one_for_one, name: Echecs.Supervisor)
   end
 end

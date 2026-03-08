@@ -91,4 +91,19 @@ defmodule Echecs.PGNTest do
     assert move2.from == Board.to_index("e1")
     assert move2.to == Board.to_index("c1")
   end
+
+  test "replays a game from a custom FEN setup" do
+    moves = PGN.parse_moves("1. O-O")
+    game = Game.new("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+
+    result = PGN.replay(game, moves)
+
+    assert match?(%Game{}, result)
+    assert Board.at(result.board, Board.to_index("g1")) == {:white, :king}
+    assert Board.at(result.board, Board.to_index("f1")) == {:white, :rook}
+  end
+
+  test "returns an error for illegal SAN" do
+    assert {:error, :no_move_found} = PGN.move_from_san(Game.new(), "Qh5")
+  end
 end

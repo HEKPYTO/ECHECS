@@ -34,14 +34,14 @@ jobs:
       - name: Check Formatting
         run: mix format --check-formatted
         
-      - name: Compile
-        run: mix compile --warnings-as-errors
-        
       - name: Run Credo Lint
         run: mix credo --strict
         
       - name: Generate Magic Cache
-        run: mix run -e "Echecs.Bitboard.Magic.init()"
+        run: elixir scripts/generate_magic_cache.exs
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
         
       - name: Run Core Tests
         run: mix test
