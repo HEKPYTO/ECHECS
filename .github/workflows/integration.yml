@@ -16,8 +16,8 @@ jobs:
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: '1.16'
-          otp-version: '26'
+          elixir-version: '1.19.5'
+          otp-version: '28'
           
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y zstd
