@@ -25,6 +25,28 @@ defmodule Echecs.Move do
     end
   end
 
+  # Fast path: caller supplies already-encoded promo/special bit fields
+  # (0 = none, promo: 1 = knight, 2 = bishop, 3 = rook, 4 = queen;
+  # special: 1 = en passant, 2 = kingside castle, 3 = queenside castle).
+  # Bit-identical to pack/4 with the corresponding atoms, minus the
+  # per-move encode_promo/encode_special remote calls.
+  defmacro pack_fast(from, to, promo_bits, special_bits) do
+    quote do
+      unquote(from) |||
+        unquote(to) <<< 6 |||
+        unquote(promo_bits) <<< 12 |||
+        unquote(special_bits) <<< 15
+    end
+  end
+
+  # Fastest path: plain move, no promotion, no special flags.
+  # Bit-identical to pack(from, to, nil, nil).
+  defmacro pack_plain(from, to) do
+    quote do
+      unquote(from) ||| unquote(to) <<< 6
+    end
+  end
+
   defmacro unpack_from(int), do: quote(do: unquote(int) &&& 0x3F)
   defmacro unpack_to(int), do: quote(do: unquote(int) >>> 6 &&& 0x3F)
 

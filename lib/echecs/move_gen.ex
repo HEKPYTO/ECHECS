@@ -5,8 +5,8 @@ defmodule Echecs.MoveGen do
   """
 
   import Bitwise
-  alias Echecs.Bitboard.{Constants, Helper, Magic, Precomputed}
-  alias Echecs.{Board, Game, Move, Piece}
+  alias Echecs.Bitboard.{Constants, Magic, Precomputed}
+  alias Echecs.{Board, Game, Move}
 
   require Echecs.Move
   require Echecs.Bitboard.Constants
@@ -15,7 +15,80 @@ defmodule Echecs.MoveGen do
 
   @mask64 Constants.mask64()
 
+  # Local bit-scan (De Bruijn), bit-identical to Helper.lsb/1.
+  # Lives here so the compiler can inline it into the hot loops below;
+  # cross-module calls to Helper.lsb/1 cannot be inlined and dominated the
+  # fresh :eprof profile (~18.5% in Helper.lsb/1 over perft 4).
+  @debruijn64 0x03F79D71B4CB0A89
+  @lsb_index {
+    0,
+    1,
+    48,
+    2,
+    57,
+    49,
+    28,
+    3,
+    61,
+    58,
+    50,
+    42,
+    38,
+    29,
+    17,
+    4,
+    62,
+    55,
+    59,
+    36,
+    53,
+    51,
+    43,
+    22,
+    45,
+    39,
+    33,
+    30,
+    24,
+    18,
+    12,
+    5,
+    63,
+    47,
+    56,
+    27,
+    60,
+    41,
+    37,
+    16,
+    54,
+    35,
+    52,
+    21,
+    44,
+    32,
+    23,
+    11,
+    46,
+    26,
+    40,
+    15,
+    34,
+    20,
+    31,
+    10,
+    25,
+    14,
+    19,
+    9,
+    13,
+    8,
+    7,
+    6
+  }
+
   @compile {:inline,
+            lsb: 1,
             get_occupancies: 2,
             get_king_bb: 2,
             get_pawns: 2,
@@ -26,7 +99,47 @@ defmodule Echecs.MoveGen do
             get_slider_bb: 3,
             get_slider_attacks: 3,
             shift_pawn: 2,
-            ensure_tuple: 1}
+            ensure_tuple: 1,
+            bitboard_to_moves_from: 3,
+            add_pawn_move: 5,
+            add_promotions: 3,
+            do_gen_sliders_fast: 5,
+            do_gen_knights_fast: 3,
+            opp: 1,
+            popc: 1,
+            right?: 3}
+
+  defp lsb(0), do: nil
+
+  defp lsb(bb) do
+    isolated = bb &&& -bb
+    prod = isolated * @debruijn64 &&& 0xFFFFFFFFFFFFFFFF
+    idx = prod >>> 58
+    elem(@lsb_index, idx)
+  end
+
+  # Local trivial getters, bit-identical to the cross-module originals.
+  # Remote calls cannot be inlined by the compiler; resolving them here as
+  # inline tuple loads removes ~40 cross-module calls per node (profile:
+  # Board/Piece/Game trivial getters ~10% of perft time).
+  # Board tuple layout (see Echecs.Board wp..bk, white/black/all_occ):
+  # white pieces 0..5, black pieces 6..11, occupancies 12/13/14.
+  defp opp(:white), do: :black
+  defp opp(:black), do: :white
+
+  # Bit-identical to Helper.pop_count/1 (Hamming-weight reduction).
+  defp popc(bb) do
+    bb = bb - (bb >>> 1 &&& 0x5555555555555555)
+    bb = (bb &&& 0x3333333333333333) + (bb >>> 2 &&& 0x3333333333333333)
+    bb = bb + (bb >>> 4) &&& 0x0F0F0F0F0F0F0F0F
+    (bb * 0x0101010101010101 &&& 0xFFFFFFFFFFFFFFFF) >>> 56
+  end
+
+  # Bit-identical to Game.has_right?/3 (castling bits wk=1, wq=2, bk=4, bq=8).
+  defp right?(castling, :white, :kingside), do: (castling &&& 1) != 0
+  defp right?(castling, :white, :queenside), do: (castling &&& 2) != 0
+  defp right?(castling, :black, :kingside), do: (castling &&& 4) != 0
+  defp right?(castling, :black, :queenside), do: (castling &&& 8) != 0
 
   # ── Public API ──
 
@@ -46,19 +159,28 @@ defmodule Echecs.MoveGen do
   end
 
   def legal_moves_int(board, turn, castling, en_passant) do
-    opponent = Piece.opponent(turn)
+    opponent = opp(turn)
 
     {us_bb, them_bb, all_bb} = get_occupancies(board, turn)
     king_bb = get_king_bb(board, turn)
-    king_sq = Helper.lsb(king_bb)
+    king_sq = lsb(king_bb)
 
-    # Compute checkers
-    checkers = compute_checkers(board, king_sq, opponent, all_bb)
-    num_checkers = Helper.pop_count(checkers)
-
-    # Compute danger squares for king (with king removed from occupancy)
+    # Compute danger squares for the king first (with king removed from
+    # occupancy). Removing the king only extends enemy rays, so a clear danger
+    # bit on our king square proves we are not in check. Checks are rare:
+    # testing that bit first skips compute_checkers' two slider magic calls
+    # on nearly every node (profile: compute_checkers ~2.4% + magic share).
     occ_no_king = bxor(all_bb, king_bb)
     danger = compute_danger(board, opponent, occ_no_king)
+
+    checkers =
+      if (danger &&& king_bb) == 0 do
+        0
+      else
+        compute_checkers(board, king_sq, opponent, all_bb)
+      end
+
+    num_checkers = if checkers == 0, do: 0, else: popc(checkers)
 
     # King moves (always generated)
     king_targets =
@@ -77,6 +199,9 @@ defmodule Echecs.MoveGen do
       {pinned, pin_rays} = compute_pins(board, king_sq, turn, us_bb, them_bb)
 
       # Generate non-king moves restricted by check_mask and pins
+      # not_us hoisted: one bnot/node instead of one per slider piece (~8/node).
+      not_us = bnot(us_bb) &&& @mask64
+
       moves
       |> gen_pawn_moves(
         board,
@@ -91,9 +216,9 @@ defmodule Echecs.MoveGen do
         king_sq
       )
       |> gen_knight_moves(board, turn, us_bb, check_mask, pinned)
-      |> gen_slider_moves(:bishop, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
-      |> gen_slider_moves(:rook, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
-      |> gen_slider_moves(:queen, board, turn, us_bb, all_bb, check_mask, pinned, pin_rays)
+      |> gen_slider_moves(:bishop, board, turn, not_us, all_bb, check_mask, pinned, pin_rays)
+      |> gen_slider_moves(:rook, board, turn, not_us, all_bb, check_mask, pinned, pin_rays)
+      |> gen_slider_moves(:queen, board, turn, not_us, all_bb, check_mask, pinned, pin_rays)
       |> gen_castling(king_sq, turn, castling, all_bb, danger, num_checkers)
     end
   end
@@ -106,14 +231,14 @@ defmodule Echecs.MoveGen do
   end
 
   def has_legal_move?(board, turn, castling, en_passant) do
-    opponent = Piece.opponent(turn)
+    opponent = opp(turn)
 
     {us_bb, them_bb, all_bb} = get_occupancies(board, turn)
     king_bb = get_king_bb(board, turn)
-    king_sq = Helper.lsb(king_bb)
+    king_sq = lsb(king_bb)
 
     checkers = compute_checkers(board, king_sq, opponent, all_bb)
-    num_checkers = Helper.pop_count(checkers)
+    num_checkers = popc(checkers)
 
     occ_no_king = bxor(all_bb, king_bb)
     danger = compute_danger(board, opponent, occ_no_king)
@@ -214,7 +339,7 @@ defmodule Echecs.MoveGen do
 
   defp compute_checkers(board, king_sq, attacker_color, all_bb) do
     # Which enemy pieces attack the king square?
-    defender_color = Piece.opponent(attacker_color)
+    defender_color = opp(attacker_color)
 
     pawn_attackers =
       Precomputed.get_pawn_attacks(king_sq, defender_color) &&& get_pawns(board, attacker_color)
@@ -233,7 +358,13 @@ defmodule Echecs.MoveGen do
   defp compute_check_mask(0, _king_sq), do: @mask64
 
   defp compute_check_mask(checkers, king_sq) do
-    checker_sq = Helper.lsb(checkers)
+    # Single-checker precondition: both call sites return early on
+    # num_checkers >= 2, so reaching here with 2+ checkers means a future
+    # caller broke the contract — fail loud instead of masking one checker.
+    if popc(checkers) > 1,
+      do: raise(ArgumentError, "compute_check_mask: #{popc(checkers)} checkers, expected 0 or 1")
+
+    checker_sq = lsb(checkers)
     Precomputed.get_between(king_sq, checker_sq) ||| 1 <<< checker_sq
   end
 
@@ -269,28 +400,28 @@ defmodule Echecs.MoveGen do
     danger = or_rook_attacks(danger, enemy_rq, occ_no_king)
 
     # Enemy king attacks
-    enemy_king_sq = Helper.lsb(get_king_bb(board, attacker_color))
+    enemy_king_sq = lsb(get_king_bb(board, attacker_color))
     if enemy_king_sq, do: danger ||| Precomputed.get_king_attacks(enemy_king_sq), else: danger
   end
 
   defp or_knight_attacks(danger, 0), do: danger
 
   defp or_knight_attacks(danger, bb) do
-    sq = Helper.lsb(bb)
+    sq = lsb(bb)
     or_knight_attacks(danger ||| Precomputed.get_knight_attacks(sq), bb &&& bb - 1)
   end
 
   defp or_bishop_attacks(danger, 0, _occ), do: danger
 
   defp or_bishop_attacks(danger, bb, occ) do
-    sq = Helper.lsb(bb)
+    sq = lsb(bb)
     or_bishop_attacks(danger ||| Magic.get_bishop_attacks(sq, occ), bb &&& bb - 1, occ)
   end
 
   defp or_rook_attacks(danger, 0, _occ), do: danger
 
   defp or_rook_attacks(danger, bb, occ) do
-    sq = Helper.lsb(bb)
+    sq = lsb(bb)
     or_rook_attacks(danger ||| Magic.get_rook_attacks(sq, occ), bb &&& bb - 1, occ)
   end
 
@@ -301,7 +432,7 @@ defmodule Echecs.MoveGen do
   # Unpinned squares have @mask64 (all-ones), pinned squares have their ray mask.
   # This enables branchless pin checking: targets &&& elem(pin_mask, from)
   defp compute_pins(board, king_sq, turn, us_bb, them_bb) do
-    opponent = Piece.opponent(turn)
+    opponent = opp(turn)
 
     # Potential HV pinners: enemy R/Q that can see king through our pieces
     enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
@@ -327,13 +458,13 @@ defmodule Echecs.MoveGen do
   defp process_pinners(0, _king_sq, _us_bb, pinned, pin_mask), do: {pinned, pin_mask}
 
   defp process_pinners(pinners, king_sq, us_bb, pinned, pin_mask) do
-    pinner_sq = Helper.lsb(pinners)
+    pinner_sq = lsb(pinners)
     between = Precomputed.get_between(king_sq, pinner_sq)
     our_between = between &&& us_bb
 
     {pinned, pin_mask} =
-      if Helper.pop_count(our_between) == 1 do
-        pinned_sq = Helper.lsb(our_between)
+      if popc(our_between) == 1 do
+        pinned_sq = lsb(our_between)
         ray = between ||| 1 <<< pinner_sq
         {pinned ||| our_between, put_elem(pin_mask, pinned_sq, ray)}
       else
@@ -345,37 +476,72 @@ defmodule Echecs.MoveGen do
 
   # ── Non-king move generation (with check_mask + pin restrictions) ──
 
-  # Knights: pinned knights can NEVER move
+  # Knights: pinned knights can NEVER move. Fast path (mirrors the slider
+  # fast path): with no check every unpinned knight move is legal, so hoist
+  # not_us once and skip the per-knight check_mask AND (profile:
+  # do_gen_knights ~4.7% of perft time, checks present in <10% of nodes).
   defp gen_knight_moves(acc, board, turn, us_bb, check_mask, pinned) do
-    knights = get_knights(board, turn) &&& bnot(pinned) &&& @mask64
-    do_gen_knights(knights, acc, us_bb, check_mask)
+    knights = get_knights(board, turn)
+    knights = if pinned == 0, do: knights, else: knights &&& bnot(pinned) &&& @mask64
+
+    if check_mask == @mask64 do
+      do_gen_knights_fast(knights, acc, bnot(us_bb) &&& @mask64)
+    else
+      do_gen_knights(knights, acc, us_bb, check_mask)
+    end
+  end
+
+  defp do_gen_knights_fast(0, acc, _not_us), do: acc
+
+  defp do_gen_knights_fast(knights, acc, not_us) do
+    from = lsb(knights)
+    targets = Precomputed.get_knight_attacks(from) &&& not_us
+    acc = bitboard_to_moves_from(targets, from, acc)
+    do_gen_knights_fast(knights &&& knights - 1, acc, not_us)
   end
 
   defp do_gen_knights(0, acc, _us_bb, _check_mask), do: acc
 
   defp do_gen_knights(knights, acc, us_bb, check_mask) do
-    from = Helper.lsb(knights)
+    from = lsb(knights)
     targets = Precomputed.get_knight_attacks(from) &&& bnot(us_bb) &&& check_mask &&& @mask64
     acc = bitboard_to_moves_from(targets, from, acc)
     do_gen_knights(knights &&& knights - 1, acc, us_bb, check_mask)
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
-  defp gen_slider_moves(acc, type, board, turn, us_bb, all_bb, check_mask, _pinned, pin_mask) do
+  defp gen_slider_moves(acc, type, board, turn, not_us, all_bb, check_mask, pinned, pin_mask) do
     bb = get_slider_bb(board, turn, type)
-    do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pin_mask)
+
+    # Fast path: no check and no pins (the common case) — skip the per-piece
+    # check_mask AND and pin_mask tuple lookup (profile: do_gen_sliders ~7.9%).
+    if pinned == 0 and check_mask == @mask64 do
+      do_gen_sliders_fast(bb, acc, type, not_us, all_bb)
+    else
+      do_gen_sliders(bb, acc, type, not_us, all_bb, check_mask, pin_mask)
+    end
   end
 
-  defp do_gen_sliders(0, acc, _type, _us_bb, _all_bb, _check_mask, _pin_mask), do: acc
+  defp do_gen_sliders_fast(0, acc, _type, _not_us, _all_bb), do: acc
 
-  defp do_gen_sliders(bb, acc, type, us_bb, all_bb, check_mask, pin_mask) do
-    from = Helper.lsb(bb)
+  defp do_gen_sliders_fast(bb, acc, type, not_us, all_bb) do
+    from = lsb(bb)
+    targets = get_slider_attacks(type, from, all_bb) &&& not_us
+    acc = bitboard_to_moves_from(targets, from, acc)
+    do_gen_sliders_fast(bb &&& bb - 1, acc, type, not_us, all_bb)
+  end
+
+  defp do_gen_sliders(0, acc, _type, _not_us, _all_bb, _check_mask, _pin_mask), do: acc
+
+  defp do_gen_sliders(bb, acc, type, not_us, all_bb, check_mask, pin_mask) do
+    from = lsb(bb)
     attacks = get_slider_attacks(type, from, all_bb)
-    # Branchless pin mask: unpinned squares have @mask64 (no-op AND), pinned have ray
-    targets = attacks &&& bnot(us_bb) &&& check_mask &&& elem(pin_mask, from) &&& @mask64
+    # Branchless pin mask: unpinned squares have @mask64 (no-op AND), pinned have ray.
+    # not_us is already @mask64-masked, so the trailing mask is a no-op here.
+    targets = attacks &&& not_us &&& check_mask &&& elem(pin_mask, from)
 
     acc = bitboard_to_moves_from(targets, from, acc)
-    do_gen_sliders(bb &&& bb - 1, acc, type, us_bb, all_bb, check_mask, pin_mask)
+    do_gen_sliders(bb &&& bb - 1, acc, type, not_us, all_bb, check_mask, pin_mask)
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -395,26 +561,55 @@ defmodule Echecs.MoveGen do
     pawns = get_pawns(board, turn)
     {push_dir, promo_rank, double_rank_mask, ep_cap_offset} = pawn_params(turn)
 
+    # Fast path: with no check (full check_mask) and no pins, every push is
+    # legal — skip the per-square check_mask/pin_mask test (profile: push
+    # extractors ~9.3% of perft time, test almost always passes).
+    unrestricted = pinned == 0 and check_mask == @mask64
+
+    # The promo test in add_pawn_move is loop-invariant per node: a white
+    # single push promotes iff it starts from squares 8..15 (mask 0xFF00), a
+    # black one iff from squares 48..55. Promos are vanishingly rare, so when
+    # no pawn sits on a pre-promo square every push is a plain move — skip
+    # the per-push promo_rank test entirely (profile:
+    # extract_pawn_pushes_fast ~6.3% of perft time).
+    promo_possible =
+      if promo_rank == 0,
+        do: (pawns &&& 0xFF00) != 0,
+        else: (pawns &&& 0x00FF000000000000) != 0
+
     # ── Single pushes ──
     single_pushes = shift_pawn(pawns, push_dir) &&& bnot(all_bb) &&& @mask64
 
     acc =
-      extract_legal_pawn_pushes(
-        single_pushes,
-        -push_dir,
-        turn,
-        promo_rank,
-        check_mask,
-        pin_mask,
-        acc
-      )
+      cond do
+        unrestricted and not promo_possible ->
+          extract_pawn_pushes_plain(single_pushes, -push_dir, acc)
+
+        unrestricted ->
+          extract_pawn_pushes_fast(single_pushes, -push_dir, turn, promo_rank, acc)
+
+        true ->
+          extract_legal_pawn_pushes(
+            single_pushes,
+            -push_dir,
+            turn,
+            promo_rank,
+            check_mask,
+            pin_mask,
+            acc
+          )
+      end
 
     # ── Double pushes ──
     double_pushes =
       shift_pawn(single_pushes &&& double_rank_mask, push_dir) &&& bnot(all_bb) &&& @mask64
 
     acc =
-      extract_legal_pawn_double_pushes(double_pushes, -push_dir * 2, check_mask, pin_mask, acc)
+      if unrestricted do
+        extract_pawn_double_pushes_fast(double_pushes, -push_dir * 2, acc)
+      else
+        extract_legal_pawn_double_pushes(double_pushes, -push_dir * 2, check_mask, pin_mask, acc)
+      end
 
     # ── Captures ──
     acc = gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pin_mask, acc)
@@ -456,7 +651,7 @@ defmodule Echecs.MoveGen do
   defp extract_legal_pawn_pushes(0, _offset, _turn, _promo_rank, _cm, _pin_mask, acc), do: acc
 
   defp extract_legal_pawn_pushes(pushes, offset, turn, promo_rank, check_mask, pin_mask, acc) do
-    to = Helper.lsb(pushes)
+    to = lsb(pushes)
     from = to + offset
     to_bit = 1 <<< to
 
@@ -481,13 +676,13 @@ defmodule Echecs.MoveGen do
   defp extract_legal_pawn_double_pushes(0, _offset, _cm, _pin_mask, acc), do: acc
 
   defp extract_legal_pawn_double_pushes(pushes, offset, check_mask, pin_mask, acc) do
-    to = Helper.lsb(pushes)
+    to = lsb(pushes)
     from = to + offset
     to_bit = 1 <<< to
 
     acc =
       if (to_bit &&& check_mask &&& elem(pin_mask, from)) != 0 do
-        [Move.pack(from, to, nil, nil) | acc]
+        [Move.pack_plain(from, to) | acc]
       else
         acc
       end
@@ -495,25 +690,108 @@ defmodule Echecs.MoveGen do
     extract_legal_pawn_double_pushes(pushes &&& pushes - 1, offset, check_mask, pin_mask, acc)
   end
 
-  defp gen_pawn_captures(0, _turn, _them_bb, _promo_rank, _cm, _pin_mask, acc), do: acc
+  # Promo-free single pushes: valid only when no pawn sits on a pre-promo
+  # square (see gen_pawn_moves), so every push is a plain move.
+  defp extract_pawn_pushes_plain(0, _offset, acc), do: acc
 
-  defp gen_pawn_captures(pawns, turn, them_bb, promo_rank, check_mask, pin_mask, acc) do
-    from = Helper.lsb(pawns)
-    attacks = Precomputed.get_pawn_attacks(from, turn)
-    # Apply pin mask to captures: only allow captures along pin ray
-    captures = attacks &&& them_bb &&& check_mask &&& elem(pin_mask, from)
+  defp extract_pawn_pushes_plain(pushes, offset, acc) do
+    to = lsb(pushes)
+    from = to + offset
 
-    acc = do_pawn_captures(captures, from, turn, promo_rank, acc)
-
-    gen_pawn_captures(pawns &&& pawns - 1, turn, them_bb, promo_rank, check_mask, pin_mask, acc)
+    extract_pawn_pushes_plain(pushes &&& pushes - 1, offset, [
+      Move.pack_plain(from, to) | acc
+    ])
   end
 
-  defp do_pawn_captures(0, _from, _turn, _promo_rank, acc), do: acc
+  # Fast paths for extract_legal_pawn_pushes/7 and
+  # extract_legal_pawn_double_pushes/5 when every push is known legal
+  # (no check, no pins): no check_mask/pin_mask tests per square.
+  defp extract_pawn_pushes_fast(0, _offset, _turn, _promo_rank, acc), do: acc
 
-  defp do_pawn_captures(captures, from, turn, promo_rank, acc) do
-    to = Helper.lsb(captures)
+  defp extract_pawn_pushes_fast(pushes, offset, turn, promo_rank, acc) do
+    to = lsb(pushes)
+    from = to + offset
     acc = add_pawn_move(acc, from, to, turn, promo_rank)
-    do_pawn_captures(captures &&& captures - 1, from, turn, promo_rank, acc)
+    extract_pawn_pushes_fast(pushes &&& pushes - 1, offset, turn, promo_rank, acc)
+  end
+
+  defp extract_pawn_double_pushes_fast(0, _offset, acc), do: acc
+
+  defp extract_pawn_double_pushes_fast(pushes, offset, acc) do
+    to = lsb(pushes)
+    from = to + offset
+
+    extract_pawn_double_pushes_fast(pushes &&& pushes - 1, offset, [
+      Move.pack_plain(from, to) | acc
+    ])
+  end
+
+  defp gen_pawn_captures(0, _turn, _them_bb, _promo_rank, _cm, _pin_mask, acc), do: acc
+
+  # Bulk capture targets via shifts (same masks as compute_danger pawn attacks).
+  # Captures are rare (profile: <1% of pawn iterations find one), so iterating
+  # actual capture squares beats one get_pawn_attacks table lookup per pawn.
+  defp gen_pawn_captures(pawns, :white, them_bb, promo_rank, check_mask, pin_mask, acc) do
+    left = (pawns &&& bnot(Constants.file_a()) &&& @mask64) >>> 9
+    right = (pawns &&& bnot(Constants.file_h()) &&& @mask64) >>> 7
+    targets = (left ||| right) &&& them_bb &&& check_mask &&& @mask64
+    do_bulk_pawn_captures(targets, left, right, 9, 7, :white, promo_rank, pin_mask, acc)
+  end
+
+  defp gen_pawn_captures(pawns, :black, them_bb, promo_rank, check_mask, pin_mask, acc) do
+    left = (pawns &&& bnot(Constants.file_a()) &&& @mask64) <<< 7
+    right = (pawns &&& bnot(Constants.file_h()) &&& @mask64) <<< 9
+    targets = (left ||| right) &&& them_bb &&& check_mask &&& @mask64
+    do_bulk_pawn_captures(targets, left, right, -7, -9, :black, promo_rank, pin_mask, acc)
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp do_bulk_pawn_captures(0, _left, _right, _ol, _or, _turn, _promo, _pm, acc), do: acc
+
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp do_bulk_pawn_captures(
+         targets,
+         left,
+         right,
+         off_left,
+         off_right,
+         turn,
+         promo_rank,
+         pin_mask,
+         acc
+       ) do
+    to = lsb(targets)
+    to_bit = 1 <<< to
+    # A square can be captured by two pawns; each (from, to) pair is pin-tested.
+    acc =
+      if (to_bit &&& left) != 0,
+        do: maybe_add_pawn_capture(acc, to + off_left, to, to_bit, turn, promo_rank, pin_mask),
+        else: acc
+
+    acc =
+      if (to_bit &&& right) != 0,
+        do: maybe_add_pawn_capture(acc, to + off_right, to, to_bit, turn, promo_rank, pin_mask),
+        else: acc
+
+    do_bulk_pawn_captures(
+      targets &&& targets - 1,
+      left,
+      right,
+      off_left,
+      off_right,
+      turn,
+      promo_rank,
+      pin_mask,
+      acc
+    )
+  end
+
+  defp maybe_add_pawn_capture(acc, from, to, to_bit, turn, promo_rank, pin_mask) do
+    if (to_bit &&& elem(pin_mask, from)) != 0 do
+      add_pawn_move(acc, from, to, turn, promo_rank)
+    else
+      acc
+    end
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -533,7 +811,7 @@ defmodule Echecs.MoveGen do
          acc
        ) do
     # Find our pawns that can capture en passant
-    ep_attackers = Precomputed.get_pawn_attacks(ep_sq, Piece.opponent(turn)) &&& pawns
+    ep_attackers = Precomputed.get_pawn_attacks(ep_sq, opp(turn)) &&& pawns
 
     do_gen_ep(
       ep_attackers,
@@ -565,7 +843,7 @@ defmodule Echecs.MoveGen do
          pin_mask,
          acc
        ) do
-    from = Helper.lsb(attackers)
+    from = lsb(attackers)
     cap_sq = ep_sq + ep_cap_offset
 
     # The captured pawn must be on check_mask OR the ep_sq itself must be on check_mask
@@ -579,14 +857,23 @@ defmodule Echecs.MoveGen do
         pin_ok = (1 <<< ep_sq &&& elem(pin_mask, from)) != 0
 
         if pin_ok do
-          # Check for horizontal discovered check (the rare EP edge case)
+          # EP discovered-check re-test: only orthogonal (rook/queen) rays.
+          # Soundness rests on a reachability precondition. The capture vacates
+          # two squares (captor `from`, victim `cap_sq`) and re-blocks on
+          # `ep_sq`, tested via `occ_after` below. Diagonal uncoverings by the
+          # captor leaving `from` are already excluded by the pin check above.
+          # The victim cannot be the sole diagonal shield of a new ray: it is
+          # an enemy pawn that just double pushed, so its square was empty in
+          # the pre-push position and that diagonal would already have been
+          # open then — impossible from a legal pre-push position. Hence, from
+          # legal double pushes only, no diagonal re-test is needed here.
           occ_after = bxor(all_bb, 1 <<< from ||| 1 <<< cap_sq) ||| 1 <<< ep_sq
-          opponent = Piece.opponent(turn)
+          opponent = opp(turn)
           enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
           rook_attacks = Magic.get_rook_attacks(king_sq, occ_after)
 
           if (rook_attacks &&& enemy_rq) == 0 do
-            [Move.pack(from, ep_sq, nil, :en_passant) | acc]
+            [Move.pack_fast(from, ep_sq, 0, 1) | acc]
           else
             acc
           end
@@ -612,21 +899,23 @@ defmodule Echecs.MoveGen do
   end
 
   defp add_pawn_move(acc, from, to, _turn, promo_rank) do
-    rank = div(to, 8)
-
-    if rank == promo_rank do
+    # to in 0..7 <=> rank 0 (white promo), to in 56..63 <=> rank 7 (black promo):
+    # comparison instead of div(to, 8) on every pawn move.
+    if (promo_rank == 0 and to < 8) or (promo_rank == 7 and to >= 56) do
       add_promotions(acc, from, to)
     else
-      [Move.pack(from, to, nil, nil) | acc]
+      [Move.pack_plain(from, to) | acc]
     end
   end
 
   defp add_promotions(acc, from, to) do
+    # Promo bit fields are loop-invariant literals: queen = 4, rook = 3,
+    # bishop = 2, knight = 1. No encode_promo call per move.
     [
-      Move.pack(from, to, :queen, nil),
-      Move.pack(from, to, :rook, nil),
-      Move.pack(from, to, :bishop, nil),
-      Move.pack(from, to, :knight, nil) | acc
+      Move.pack_fast(from, to, 4, 0),
+      Move.pack_fast(from, to, 3, 0),
+      Move.pack_fast(from, to, 2, 0),
+      Move.pack_fast(from, to, 1, 0) | acc
     ]
   end
 
@@ -643,7 +932,7 @@ defmodule Echecs.MoveGen do
   end
 
   defp try_castle(acc, side, castling, king_sq, turn, all_bb, danger) do
-    if Game.has_right?(castling, turn, side) do
+    if right?(castling, turn, side) do
       {path_mask, check_mask, target, special} = castle_params(side, turn)
 
       # Path must be clear and traversal squares not attacked (single bitwise op each)
@@ -719,7 +1008,7 @@ defmodule Echecs.MoveGen do
         true
 
       num_checkers == 0 ->
-        any_castle_int?(castling, Helper.lsb(get_king_bb(board, turn)), turn, all_bb, danger)
+        any_castle_int?(castling, lsb(get_king_bb(board, turn)), turn, all_bb, danger)
 
       true ->
         false
@@ -729,7 +1018,7 @@ defmodule Echecs.MoveGen do
   defp any_knight_move?(0, _us_bb, _check_mask), do: false
 
   defp any_knight_move?(knights, us_bb, check_mask) do
-    from = Helper.lsb(knights)
+    from = lsb(knights)
     targets = Precomputed.get_knight_attacks(from) &&& bnot(us_bb) &&& check_mask &&& @mask64
     if targets != 0, do: true, else: any_knight_move?(knights &&& knights - 1, us_bb, check_mask)
   end
@@ -742,7 +1031,7 @@ defmodule Echecs.MoveGen do
   defp any_slider_move_loop?(0, _type, _us_bb, _all_bb, _cm, _pm), do: false
 
   defp any_slider_move_loop?(bb, type, us_bb, all_bb, check_mask, pin_mask) do
-    from = Helper.lsb(bb)
+    from = lsb(bb)
     attacks = get_slider_attacks(type, from, all_bb)
     targets = attacks &&& bnot(us_bb) &&& check_mask &&& elem(pin_mask, from) &&& @mask64
 
@@ -783,7 +1072,7 @@ defmodule Echecs.MoveGen do
         true
 
       ep_sq != nil ->
-        ep_attackers = Precomputed.get_pawn_attacks(ep_sq, Piece.opponent(turn)) &&& pawns
+        ep_attackers = Precomputed.get_pawn_attacks(ep_sq, opp(turn)) &&& pawns
 
         ep_attackers != 0 and
           ep_is_legal_any?(
@@ -807,7 +1096,7 @@ defmodule Echecs.MoveGen do
   defp any_in_mask?(0, _cm, _pm, _offset), do: false
 
   defp any_in_mask?(bb, check_mask, pin_mask, offset) do
-    to = Helper.lsb(bb)
+    to = lsb(bb)
     from = to + offset
     to_bit = 1 <<< to
 
@@ -819,7 +1108,7 @@ defmodule Echecs.MoveGen do
   defp any_pawn_capture?(0, _turn, _them, _cm, _pm), do: false
 
   defp any_pawn_capture?(pawns, turn, them_bb, check_mask, pin_mask) do
-    from = Helper.lsb(pawns)
+    from = lsb(pawns)
     attacks = Precomputed.get_pawn_attacks(from, turn)
     captures = attacks &&& them_bb &&& check_mask &&& elem(pin_mask, from)
 
@@ -845,7 +1134,7 @@ defmodule Echecs.MoveGen do
          pin_mask,
          check_mask
        ) do
-    from = Helper.lsb(attackers)
+    from = lsb(attackers)
     cap_sq = ep_sq + ep_cap_offset
 
     ep_valid = (1 <<< ep_sq &&& check_mask) != 0 or (1 <<< cap_sq &&& check_mask) != 0
@@ -856,7 +1145,7 @@ defmodule Echecs.MoveGen do
 
         if pin_ok do
           occ_after = bxor(all_bb, 1 <<< from ||| 1 <<< cap_sq) ||| 1 <<< ep_sq
-          opponent = Piece.opponent(turn)
+          opponent = opp(turn)
           enemy_rq = get_rooks(board, opponent) ||| get_queens(board, opponent)
           rook_attacks = Magic.get_rook_attacks(king_sq, occ_after)
           (rook_attacks &&& enemy_rq) == 0
@@ -890,7 +1179,7 @@ defmodule Echecs.MoveGen do
   end
 
   defp any_castle_side?(side, castling, _king_sq, turn, all_bb, danger) do
-    if Game.has_right?(castling, turn, side) do
+    if right?(castling, turn, side) do
       {path_mask, check_mask, _target, _special} = castle_params(side, turn)
       (all_bb &&& path_mask) == 0 and (danger &&& check_mask) == 0
     else
@@ -1035,15 +1324,14 @@ defmodule Echecs.MoveGen do
   defp extract_pawn_moves(0, _, _, acc), do: acc
 
   defp extract_pawn_moves(targets, offset, color, acc) do
-    to = Helper.lsb(targets)
+    to = lsb(targets)
     from = to + offset
-    rank = div(to, 8)
 
     acc =
-      if (color == :white and rank == 0) or (color == :black and rank == 7) do
+      if (color == :white and to < 8) or (color == :black and to >= 56) do
         add_promotions(acc, from, to)
       else
-        [Move.pack(from, to, nil, nil) | acc]
+        [Move.pack_plain(from, to) | acc]
       end
 
     extract_pawn_moves(targets &&& targets - 1, offset, color, acc)
@@ -1052,10 +1340,10 @@ defmodule Echecs.MoveGen do
   defp extract_pawn_double_moves(0, _, acc), do: acc
 
   defp extract_pawn_double_moves(targets, offset, acc) do
-    to = Helper.lsb(targets)
+    to = lsb(targets)
 
     extract_pawn_double_moves(targets &&& targets - 1, offset, [
-      Move.pack(to + offset, to, nil, nil) | acc
+      Move.pack_plain(to + offset, to) | acc
     ])
   end
 
@@ -1069,7 +1357,7 @@ defmodule Echecs.MoveGen do
   defp do_generate_pawn_captures(0, acc, _, _, _), do: acc
 
   defp do_generate_pawn_captures(pawns, acc, color, valid_targets, ep_sq) do
-    from = Helper.lsb(pawns)
+    from = lsb(pawns)
     attacks = Precomputed.get_pawn_attacks(from, color)
     captures = attacks &&& valid_targets
 
@@ -1080,19 +1368,17 @@ defmodule Echecs.MoveGen do
   defp do_add_pawn_capture_moves(0, acc, _, _, _), do: acc
 
   defp do_add_pawn_capture_moves(captures, acc, from, color, ep_sq) do
-    to = Helper.lsb(captures)
+    to = lsb(captures)
     acc = add_pawn_capture_move(from, to, acc, color, ep_sq)
     do_add_pawn_capture_moves(captures &&& captures - 1, acc, from, color, ep_sq)
   end
 
   defp add_pawn_capture_move(from, to, m, color, ep_sq) do
-    special = if to == ep_sq, do: :en_passant, else: nil
-    rank = div(to, 8)
-
-    if (color == :white and rank == 0) or (color == :black and rank == 7) do
+    if (color == :white and to < 8) or (color == :black and to >= 56) do
       add_promotions(m, from, to)
     else
-      [Move.pack(from, to, nil, special) | m]
+      sbits = if to == ep_sq, do: 1, else: 0
+      [Move.pack_fast(from, to, 0, sbits) | m]
     end
   end
 
@@ -1104,7 +1390,7 @@ defmodule Echecs.MoveGen do
   defp do_gen_knights_pseudo(0, acc, _), do: acc
 
   defp do_gen_knights_pseudo(knights, acc, target_mask) do
-    from = Helper.lsb(knights)
+    from = lsb(knights)
     valid_moves = Precomputed.get_knight_attacks(from) &&& target_mask
     acc = bitboard_to_moves_from(valid_moves, from, acc)
     do_gen_knights_pseudo(knights &&& knights - 1, acc, target_mask)
@@ -1118,7 +1404,7 @@ defmodule Echecs.MoveGen do
   defp do_gen_sliders_pseudo(0, acc, _, _, _), do: acc
 
   defp do_gen_sliders_pseudo(bb, acc, type, all_bb, target_mask) do
-    from = Helper.lsb(bb)
+    from = lsb(bb)
     attacks = get_slider_attacks(type, from, all_bb)
     valid_moves = attacks &&& target_mask
     acc = bitboard_to_moves_from(valid_moves, from, acc)
@@ -1131,7 +1417,7 @@ defmodule Echecs.MoveGen do
     if king_bb == 0 do
       acc
     else
-      king_sq = Helper.lsb(king_bb)
+      king_sq = lsb(king_bb)
       valid_moves = Precomputed.get_king_attacks(king_sq) &&& target_mask
       bitboard_to_moves_from(valid_moves, king_sq, acc)
     end
@@ -1142,9 +1428,9 @@ defmodule Echecs.MoveGen do
       acc
     else
       board = ensure_tuple(game.board)
-      king_sq = Helper.lsb(king_bb)
+      king_sq = lsb(king_bb)
       castling = game.castling
-      opponent = Piece.opponent(turn)
+      opponent = opp(turn)
 
       if Board.attacked?(board, king_sq, opponent) do
         acc
@@ -1157,7 +1443,7 @@ defmodule Echecs.MoveGen do
   end
 
   defp check_castling_pseudo(acc, side, castling, king_sq, turn, board, opponent) do
-    if Game.has_right?(castling, turn, side) and can_castle_pseudo?(side, turn, board, opponent) do
+    if right?(castling, turn, side) and can_castle_pseudo?(side, turn, board, opponent) do
       target = if side == :kingside, do: king_sq + 2, else: king_sq - 2
       special = if side == :kingside, do: :kingside_castle, else: :queenside_castle
       [Move.pack(king_sq, target, nil, special) | acc]
@@ -1315,15 +1601,16 @@ defmodule Echecs.MoveGen do
   defp bitboard_to_moves_to(0, _, acc), do: acc
 
   defp bitboard_to_moves_to(bb, to, acc) do
-    from = Helper.lsb(bb)
-    bitboard_to_moves_to(bb &&& bb - 1, to, [Move.pack(from, to, nil, nil) | acc])
+    from = lsb(bb)
+    bitboard_to_moves_to(bb &&& bb - 1, to, [Move.pack_plain(from, to) | acc])
   end
 
   defp bitboard_to_moves_from(0, _, acc), do: acc
 
   defp bitboard_to_moves_from(bb, from, acc) do
-    to = Helper.lsb(bb)
-    bitboard_to_moves_from(bb &&& bb - 1, from, [Move.pack(from, to, nil, nil) | acc])
+    to = lsb(bb)
+    # from is loop-invariant here; plain pack skips both encode calls per target.
+    bitboard_to_moves_from(bb &&& bb - 1, from, [Move.pack_plain(from, to) | acc])
   end
 
   # ── Piece accessor helpers ──
@@ -1332,37 +1619,37 @@ defmodule Echecs.MoveGen do
   defp ensure_tuple(board), do: Board.from_struct(board)
 
   defp get_occupancies(board, :white) do
-    {Board.white_occ(board), Board.black_occ(board), Board.all_occ(board)}
+    {elem(board, 12), elem(board, 13), elem(board, 14)}
   end
 
   defp get_occupancies(board, :black) do
-    {Board.black_occ(board), Board.white_occ(board), Board.all_occ(board)}
+    {elem(board, 13), elem(board, 12), elem(board, 14)}
   end
 
-  defp get_king_bb(board, :white), do: Board.wk(board)
-  defp get_king_bb(board, :black), do: Board.bk(board)
+  defp get_king_bb(board, :white), do: elem(board, 5)
+  defp get_king_bb(board, :black), do: elem(board, 11)
 
-  defp get_pawns(board, :white), do: Board.wp(board)
-  defp get_pawns(board, :black), do: Board.bp(board)
+  defp get_pawns(board, :white), do: elem(board, 0)
+  defp get_pawns(board, :black), do: elem(board, 6)
 
-  defp get_knights(board, :white), do: Board.wn(board)
-  defp get_knights(board, :black), do: Board.bn(board)
+  defp get_knights(board, :white), do: elem(board, 1)
+  defp get_knights(board, :black), do: elem(board, 7)
 
-  defp get_bishops(board, :white), do: Board.wb(board)
-  defp get_bishops(board, :black), do: Board.bb(board)
+  defp get_bishops(board, :white), do: elem(board, 2)
+  defp get_bishops(board, :black), do: elem(board, 8)
 
-  defp get_rooks(board, :white), do: Board.wr(board)
-  defp get_rooks(board, :black), do: Board.br(board)
+  defp get_rooks(board, :white), do: elem(board, 3)
+  defp get_rooks(board, :black), do: elem(board, 9)
 
-  defp get_queens(board, :white), do: Board.wq(board)
-  defp get_queens(board, :black), do: Board.bq(board)
+  defp get_queens(board, :white), do: elem(board, 4)
+  defp get_queens(board, :black), do: elem(board, 10)
 
-  defp get_slider_bb(board, :white, :bishop), do: Board.wb(board)
-  defp get_slider_bb(board, :white, :rook), do: Board.wr(board)
-  defp get_slider_bb(board, :white, :queen), do: Board.wq(board)
-  defp get_slider_bb(board, :black, :bishop), do: Board.bb(board)
-  defp get_slider_bb(board, :black, :rook), do: Board.br(board)
-  defp get_slider_bb(board, :black, :queen), do: Board.bq(board)
+  defp get_slider_bb(board, :white, :bishop), do: elem(board, 2)
+  defp get_slider_bb(board, :white, :rook), do: elem(board, 3)
+  defp get_slider_bb(board, :white, :queen), do: elem(board, 4)
+  defp get_slider_bb(board, :black, :bishop), do: elem(board, 8)
+  defp get_slider_bb(board, :black, :rook), do: elem(board, 9)
+  defp get_slider_bb(board, :black, :queen), do: elem(board, 10)
 
   defp get_slider_attacks(:bishop, from, all_bb), do: Magic.get_bishop_attacks(from, all_bb)
   defp get_slider_attacks(:rook, from, all_bb), do: Magic.get_rook_attacks(from, all_bb)
@@ -1370,16 +1657,16 @@ defmodule Echecs.MoveGen do
   defp get_slider_attacks(:queen, from, all_bb),
     do: Magic.get_bishop_attacks(from, all_bb) ||| Magic.get_rook_attacks(from, all_bb)
 
-  defp get_piece_bb(board, :white, :pawn), do: Board.wp(board)
-  defp get_piece_bb(board, :white, :knight), do: Board.wn(board)
-  defp get_piece_bb(board, :white, :bishop), do: Board.wb(board)
-  defp get_piece_bb(board, :white, :rook), do: Board.wr(board)
-  defp get_piece_bb(board, :white, :queen), do: Board.wq(board)
-  defp get_piece_bb(board, :white, :king), do: Board.wk(board)
-  defp get_piece_bb(board, :black, :pawn), do: Board.bp(board)
-  defp get_piece_bb(board, :black, :knight), do: Board.bn(board)
-  defp get_piece_bb(board, :black, :bishop), do: Board.bb(board)
-  defp get_piece_bb(board, :black, :rook), do: Board.br(board)
-  defp get_piece_bb(board, :black, :queen), do: Board.bq(board)
-  defp get_piece_bb(board, :black, :king), do: Board.bk(board)
+  defp get_piece_bb(board, :white, :pawn), do: elem(board, 0)
+  defp get_piece_bb(board, :white, :knight), do: elem(board, 1)
+  defp get_piece_bb(board, :white, :bishop), do: elem(board, 2)
+  defp get_piece_bb(board, :white, :rook), do: elem(board, 3)
+  defp get_piece_bb(board, :white, :queen), do: elem(board, 4)
+  defp get_piece_bb(board, :white, :king), do: elem(board, 5)
+  defp get_piece_bb(board, :black, :pawn), do: elem(board, 6)
+  defp get_piece_bb(board, :black, :knight), do: elem(board, 7)
+  defp get_piece_bb(board, :black, :bishop), do: elem(board, 8)
+  defp get_piece_bb(board, :black, :rook), do: elem(board, 9)
+  defp get_piece_bb(board, :black, :queen), do: elem(board, 10)
+  defp get_piece_bb(board, :black, :king), do: elem(board, 11)
 end
