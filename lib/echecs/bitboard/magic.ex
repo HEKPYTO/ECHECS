@@ -40,24 +40,38 @@ defmodule Echecs.Bitboard.Magic do
   @compile {:inline, get_rook_attacks: 2, get_bishop_attacks: 2}
 
   for %{sq: sq, mask: mask, magic: magic, shift: shift, table: table} <- rooks do
+    table_tuple = for <<a::64-little <- table>>, do: a
+    table_tuple = List.to_tuple(table_tuple)
+
+    if tuple_size(table_tuple) != 1 <<< (64 - shift) do
+      raise "magic table size mismatch (rook sq #{sq}): got #{tuple_size(table_tuple)}, expected #{1 <<< (64 - shift)}"
+    end
+
+    table_esc = Macro.escape(table_tuple)
+
     def get_rook_attacks(unquote(sq), occupancy) do
       idx =
         ((occupancy &&& unquote(mask)) * unquote(magic) &&& 0xFFFFFFFFFFFFFFFF) >>> unquote(shift)
 
-      offset = idx * 8
-      <<attacks::64-little-integer>> = :binary.part(unquote(table), offset, 8)
-      attacks
+      elem(unquote(table_esc), idx)
     end
   end
 
   for %{sq: sq, mask: mask, magic: magic, shift: shift, table: table} <- bishops do
+    table_tuple = for <<a::64-little <- table>>, do: a
+    table_tuple = List.to_tuple(table_tuple)
+
+    if tuple_size(table_tuple) != 1 <<< (64 - shift) do
+      raise "magic table size mismatch (bishop sq #{sq}): got #{tuple_size(table_tuple)}, expected #{1 <<< (64 - shift)}"
+    end
+
+    table_esc = Macro.escape(table_tuple)
+
     def get_bishop_attacks(unquote(sq), occupancy) do
       idx =
         ((occupancy &&& unquote(mask)) * unquote(magic) &&& 0xFFFFFFFFFFFFFFFF) >>> unquote(shift)
 
-      offset = idx * 8
-      <<attacks::64-little-integer>> = :binary.part(unquote(table), offset, 8)
-      attacks
+      elem(unquote(table_esc), idx)
     end
   end
 end

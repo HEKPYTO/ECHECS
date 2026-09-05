@@ -94,8 +94,6 @@ defmodule Echecs.Zobrist do
     end
   end
 
-  require Echecs.Move
-
   def update_hash(
         current_hash,
         move,
