@@ -34,7 +34,7 @@ Add `echecs` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:echecs, "~> 0.1.4"}
+    {:echecs, "~> 0.1.5"}
   ]
 end
 ```
