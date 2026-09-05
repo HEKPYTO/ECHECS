@@ -40,6 +40,11 @@ jobs:
         
       - name: Run Core Tests
         run: mix test
+
+      - name: Publish to Hex.pm
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
         
       - name: Build Docs
         run: mix docs

@@ -4,7 +4,7 @@ defmodule Echecs.MixProject do
   def project do
     [
       app: :echecs,
-      version: "0.1.4",
+      version: "0.1.5",
       elixir: "~> 1.16",
       elixirc_options: [warnings_as_errors: true],
       start_permanent: Mix.env() == :prod,
