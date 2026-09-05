@@ -1,6 +1,12 @@
 defmodule Echecs.Bitboard.MagicGenerator do
   @moduledoc """
-  Generates Magic Numbers and Attack Tables for Sliding Pieces (Rook, Bishop).
+  Finds magic numbers and attack tables for sliding pieces (rooks, bishops).
+
+  `find_all_magics/0` searches magics in parallel worker tasks (see
+  `find_all_magics_serial/0` for the sequential variant) and returns data
+  suitable for `scripts/generate_magic_cache.exs`, which writes the
+  `priv/magic_cache.bin` file consumed at compile time by
+  `Echecs.Bitboard.Magic`. Only needed when regenerating the cache.
   """
   import Bitwise
   alias Echecs.Bitboard.Helper

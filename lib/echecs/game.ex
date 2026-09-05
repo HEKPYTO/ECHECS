@@ -1,6 +1,12 @@
 defmodule Echecs.Game do
   @moduledoc """
-  Holds the complete state of a chess game.
+  Complete state of a chess game: board tuple, side to move, castling rights
+  (bit flags `wk = 1`, `wq = 2`, `bk = 4`, `bq = 8`), en-passant square,
+  half/fullmove clocks, position history, Zobrist hash and cached king squares.
+
+  Build positions with `new/1` (FEN), advance them with `make_move/2` (struct
+  moves) or `advance_position/6` (packed moves on raw tuples, used by perft),
+  and query terminal state with `checkmate?/1`, `stalemate?/1` and `draw?/1`.
   """
 
   import Bitwise

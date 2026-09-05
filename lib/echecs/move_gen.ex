@@ -1,7 +1,16 @@
 defmodule Echecs.MoveGen do
   @moduledoc """
-  Legal-only move generation using check_mask + pin_mask technique.
-  Generates only legal moves directly without pseudo-legal filtering.
+  Legal-only move generation using the check-mask + pin-mask technique.
+
+  Instead of generating pseudo-legal moves and filtering them, `legal_moves_int/4`
+  computes the checking pieces (`check_mask`) and the pinned rays (`pin_rays`)
+  once per position, then emits only legal moves: king moves avoid the danger
+  set, and all other moves are masked by `check_mask` and their pin ray. Double
+  check exits early with king moves only.
+
+  Moves are emitted as packed integers (see `Echecs.Move`) and converted to
+  structs only at the API boundary by `legal_moves/1`. The `captures/1` and
+  `quiets/1` variants share the same pipeline for search use.
   """
 
   import Bitwise

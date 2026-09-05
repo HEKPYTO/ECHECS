@@ -1,6 +1,10 @@
 defmodule Echecs.FEN do
   @moduledoc """
-  Handles parsing and generation of Forsyth-Edwards Notation (FEN) strings.
+  Parsing and generation of Forsyth-Edwards Notation (FEN) strings.
+
+  `parse/1` turns a FEN string into board, turn, castling, en-passant and clock
+  fields consumed by `Echecs.Game.new/1`; `to_string/1` serializes a game back.
+  Squares follow the `Echecs.Board` 0 = a8 convention.
   """
 
   alias Echecs.{Board, Piece}

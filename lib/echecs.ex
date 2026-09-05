@@ -2,7 +2,11 @@ defmodule Echecs do
   @moduledoc """
   Echecs is a pure Elixir chess library for move generation, validation, and game state management.
 
-  This module serves as the main entry point for interacting with a chess game.
+  This module is the main entry point: `new_game/0` and `new_game/1` build a `%Echecs.Game{}`
+  from the start position or a FEN string, `legal_moves/1` lists legal moves,
+  `make_move/4` applies one if legal (`{:ok, game}` / `{:error, :illegal_move}`),
+  and `status/1` reports `:active`, `:checkmate`, `:stalemate` or `:draw`.
+  Internals live in `Echecs.Game`, `Echecs.MoveGen` and `Echecs.Board`.
   """
 
   alias Echecs.{Game, MoveGen}

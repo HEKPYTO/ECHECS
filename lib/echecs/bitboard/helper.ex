@@ -1,6 +1,11 @@
 defmodule Echecs.Bitboard.Helper do
   @moduledoc """
-  Low-level bit manipulation helpers for Bitboards.
+  Low-level bit manipulation helpers for bitboards.
+
+  `lsb/1` finds the least-significant set square (De Bruijn sequence, `nil`
+  for empty) and `pop_count/1` counts set bits; both are compiler-inlined.
+  Directional shifts (`shift_north/1` and siblings) mask file wraps via
+  `Echecs.Bitboard.Constants`.
   """
   import Bitwise
 

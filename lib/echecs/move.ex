@@ -1,6 +1,15 @@
 defmodule Echecs.Move do
   @moduledoc """
-  Represents a chess move.
+  Chess moves as structs and as packed integers.
+
+  The engine generates moves as packed integers: `from` (bits 0–5), `to`
+  (bits 6–11), promotion (bits 12–14: 0 = none, 1 = knight, 2 = bishop,
+  3 = rook, 4 = queen) and special flags (bits 15–17: 0 = none, 1 = en
+  passant, 2 = kingside castle, 3 = queenside castle). `pack/4` encodes from
+  atoms, `pack_fast/4` from pre-encoded bit fields and `pack_plain/2` for plain
+  moves; `unpack_from/1`, `unpack_to/1`, `unpack_promotion/1` and
+  `unpack_special/1` decode. `to_struct/1` converts to `%Move{}` at the API
+  boundary.
   """
 
   import Bitwise
