@@ -1,6 +1,11 @@
 defmodule Echecs.Piece do
   @moduledoc """
-  Defines chess piece types and colors.
+  Piece colors (`:white`, `:black`) and types (`:pawn`, `:knight`, `:bishop`,
+  `:rook`, `:queen`, `:king`).
+
+  A piece is a `{color, type}` tuple. Helpers cover side switching
+  (`opponent/1`) and FEN-character conversion (`from_char/1`, `to_char/1`,
+  `type_from_char/1`, `color_from_char/1`).
   """
 
   @type color :: :white | :black

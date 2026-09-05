@@ -1,6 +1,17 @@
 defmodule Echecs.Board do
   @moduledoc """
-  Represents a chess board using Bitboards.
+  Chess board as a 15-element tuple of 64-bit integer bitboards.
+
+  ## Layout
+
+  Elements `0..5` hold the white pawns, knights, bishops, rooks, queens and
+  king; `6..11` the black pieces in the same order; `12`, `13` and `14` cache
+  the white, black and combined occupancies.
+
+  Square `0` is a8 and square `63` is h1 (`1 <<< ((7 - rank) * 8 + file)`),
+  so white pawns advance toward lower indices. Use `at_tuple/2` for piece lookup and
+  `make_move_on_board_tuple/3` for the allocation-free move application used
+  by the move generator's fast path.
   """
 
   import Bitwise

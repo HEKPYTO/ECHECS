@@ -1,7 +1,11 @@
 defmodule Echecs.Bitboard.Precomputed do
   @moduledoc """
-  Precomputed tables for Knight, King, Pawn attacks, and geometric masks (between/line).
-  All tables are computed at compile time for zero runtime cost.
+  Compile-time attack and geometry tables for non-sliding queries.
+
+  Knight, king and pawn attacks plus `between`/`line` masks are generated at
+  compile time into tuples, so `get_knight_attacks/1`, `get_king_attacks/1`,
+  `get_pawn_attacks/2`, `get_between/2` and `get_line/2` are single `elem/2`
+  lookups with zero runtime cost.
   """
   import Bitwise
   alias Echecs.Bitboard.MagicGenerator

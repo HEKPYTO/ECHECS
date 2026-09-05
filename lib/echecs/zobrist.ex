@@ -1,7 +1,11 @@
 defmodule Echecs.Zobrist do
   @moduledoc """
-  Zobrist Hashing implementation for fast state repetition detection.
-  Optimized using Tuple-based lookups for O(1) access, fully computed at compile time.
+  Zobrist hashing for fast position identity and repetition detection.
+
+  All random keys (piece/square, castling states, en-passant files, side to
+  move) are generated once at compile time into tuple tables. `hash/4` hashes
+  a full position; `update_hash_int/10` incrementally updates a hash from
+  unpacked move fields without touching the board.
   """
   import Bitwise
 

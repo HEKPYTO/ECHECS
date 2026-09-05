@@ -1,6 +1,11 @@
 defmodule Echecs.PGN do
   @moduledoc """
-  Simple PGN parser and replayer for testing against Lichess DB.
+  Minimal PGN move-text parser and replayer.
+
+  `parse_moves/1` strips comments, variations, move numbers, results and NAGs
+  down to SAN tokens; `replay/2` matches each token against legal moves and
+  advances the game. Built for large-scale replay validation against Lichess
+  database dumps (see `test/integration/lichess_db_test.exs`).
   """
 
   alias Echecs.{Board, Game, MoveGen}

@@ -1,6 +1,13 @@
 defmodule Echecs.Bitboard.Magic do
   @moduledoc """
-  Magic bitboard lookups for sliding piece attacks.
+  Magic-bitboard attack lookups for sliding pieces (rooks, bishops).
+
+  At compile time the cached magics in `priv/magic_cache.bin` are unrolled
+  into per-square `get_rook_attacks/2` and `get_bishop_attacks/2` clauses:
+  each masks the occupancy, multiplies by the square's magic, shifts to an
+  index and reads the attack set from an embedded tuple table — O(1) with no
+  runtime cache lookup. Regenerate the cache with
+  `scripts/generate_magic_cache.exs` (see `Echecs.Bitboard.MagicGenerator`).
   """
 
   import Bitwise

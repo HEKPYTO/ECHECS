@@ -1,7 +1,9 @@
 defmodule Echecs.Bitboard do
   @moduledoc """
-  Core Bitboard implementation using 64-bit Integers.
-  This represents the board state and provides optimized bitwise operations.
+  Legacy struct-based bitboard container, superseded by the `Echecs.Board`
+  tuple representation used throughout the engine.
+
+  Kept for compatibility; new code should use the tuple board API.
   """
   import Bitwise
 

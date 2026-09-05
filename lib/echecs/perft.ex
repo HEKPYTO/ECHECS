@@ -1,6 +1,13 @@
 defmodule Echecs.Perft do
   @moduledoc """
-  Performance-test helpers for validating move generation.
+  Performance-test (perft) helpers for validating move generation.
+
+  `perft/2` counts leaf nodes from a `%Game{}`; `perft_fast/5` and `perft_fast/6`
+  recurse on raw `(board_tuple, turn, castling, en_passant)` state without allocating game
+  structs. `perft_parallel/2` distributes root moves over all schedulers and
+  `divide/2` returns per-root-move counts for debugging. Compare results
+  against the standard reference nodes (start position depth 5: 4,865,609;
+  Kiwipete depth 3: 97,862).
   """
 
   alias Echecs.{Board, Game, MoveGen}
