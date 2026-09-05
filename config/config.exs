@@ -9,7 +9,8 @@ if Mix.env() == :dev do
         tasks: [
           {:cmd, "mix format --check-formatted"},
           {:cmd, "mix credo --strict"},
-          {:cmd, "mix test --exclude integration --exclude comparison"}
+          {:cmd, "mix compile --warnings-as-errors"},
+          {:cmd, "mix dialyzer"}
         ]
       ]
     ]
